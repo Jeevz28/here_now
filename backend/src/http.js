@@ -1,0 +1,53 @@
+import {performanceMiddleware} from './performance.js';
+import express from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import {Limiter,errorData,fail} from './core.js';
+export function createHttpApp(service,{origins=[],rateLimits=true}={}){
+  const app=express(),limits=new Limiter();
+  app.use(performanceMiddleware);app.disable('x-powered-by');app.use(helmet());
+  app.use(cors({origin:(origin,cb)=>cb(null,!origin||origins.includes(origin)),methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Authorization','Content-Type'],exposedHeaders:['Server-Timing']}));
+  app.use(express.json({limit:'16kb'}));
+  app.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');try{if(rateLimits)limits.take(req.ip+':'+(req.path.startsWith('/auth/')?'auth':'api'),req.path.startsWith('/auth/')?12:240);next();}catch(e){next(e);}});
+  app.get('/health',async(req,res)=>{await service.db.command({ping:1});res.json({status:'ok',demoMode:service.demoMode,backend:'node',database:'mongodb',realtime:'websocket'});});
+  app.post('/auth/register',async(req,res)=>res.status(201).json(await service.register(req.body)));
+  app.post('/auth/login',async(req,res)=>res.json(await service.login(req.body)));
+  app.use(async(req,res,next)=>{const header=req.headers.authorization||'';if(!header.startsWith('Bearer '))fail(401,'Please sign in.');req.principal=await service.authenticate(header.slice(7));next();});
+  const route=(method,path,fn,status=200)=>app[method](path,async(req,res)=>res.status(status).json(await fn(req.principal,req)));
+  route('post','/location',(p,r)=>service.updateLocation(p,r.body));
+  route('delete','/location',(p,r)=>service.revokeLocation(p,r.body));
+  route('get','/state',p=>service.state(p));
+  route('get','/me',p=>service.me(p));
+  route('patch','/me',(p,r)=>service.profile(p,r.body));
+  route('delete','/me',p=>service.deleteMe(p));
+  route('post','/auth/logout',p=>service.logout(p));
+  route('get','/places',p=>service.places(p));
+  route('post','/presence',(p,r)=>service.enter(p,r.body));
+  route('post','/presence/heartbeat',(p,r)=>service.heartbeat(p,r.body));
+  route('delete','/presence',p=>service.leave(p));
+  route('get','/circle',p=>service.circle(p));
+  route('get','/conversations',p=>service.chats(p));
+  route('post','/conversations',(p,r)=>service.startChat(p,r.body),201);
+  route('get','/conversations/:cid',(p,r)=>service.chat(p,r.params.cid));
+  route('get','/conversations/:cid/summary',(p,r)=>service.chatSummary(p,r.params.cid));
+  route('post','/conversations/:cid/read',(p,r)=>service.readMessages(p,r.params.cid,r.body));
+  route('delete','/conversations/:cid',(p,r)=>service.endChat(p,r.params.cid));
+  route('get','/conversations/:cid/messages',(p,r)=>service.olderMessages(p,r.params.cid,r.query.before));
+  route('post','/conversations/:cid/messages',(p,r)=>service.sendMessage(p,r.params.cid,r.body),201);
+  route('post','/conversations/:cid/vibe',(p,r)=>service.vibe(p,r.params.cid,r.body));
+  route('post','/conversations/:cid/ready',(p,r)=>service.ready(p,r.params.cid,r.body));
+  route('get','/activities',p=>service.activities(p));
+  route('post','/activities',(p,r)=>service.createActivity(p,r.body),201);
+  route('post','/activities/:aid/join',(p,r)=>service.joinActivity(p,r.params.aid));
+  route('delete','/activities/:aid/membership',(p,r)=>service.leaveActivity(p,r.params.aid));
+  route('get','/blocks',p=>service.blocks(p));
+  route('post','/blocks',(p,r)=>service.block(p,r.body));
+  route('delete','/blocks/:target',(p,r)=>service.unblock(p,r.params.target));
+  route('post','/reports',(p,r)=>service.report(p,r.body),201);
+  app.use((req,res)=>res.status(404).json({detail:'Endpoint not found.'}));
+  app.use((error,req,res,next)=>{
+    const data=error.type==='entity.too.large'?{status:413,detail:'Request is too large.'}:error instanceof SyntaxError&&error.status===400?{status:400,detail:'Invalid JSON.'}:errorData(error);
+    if(data.status===500)console.error('HTTP operation failed:',error.name); // No bodies/tokens/coordinates in logs.
+    res.status(data.status).json({detail:data.detail});
+  });return app;
+}
