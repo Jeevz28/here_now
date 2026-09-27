@@ -1,7 +1,29 @@
 {
-  "name":"herenow-api","version":"2.0.0","private":true,"type":"module",
-  "engines":{"node":">=22.13"},
-  "scripts":{"start":"node src/server.js","dev":"node --watch src/server.js","test":"node --test --test-concurrency=1 test/*.test.js","manage":"node src/manage.js","check":"node --check src/service.js && node --check src/http.js && node --check src/realtime.js"},
-  "dependencies":{"cors":"2.8.5","dotenv":"16.5.0","express":"5.1.0","helmet":"8.1.0","mongodb":"6.16.0","ws":"8.18.3","zod":"3.24.4"},
-  "devDependencies":{"mongodb-memory-server":"10.2.3"}
+  "name": "herenow-api",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "manage": "node src/manage.js",
+    "check": "node --check src/service.js && node --check src/http.js && node --check src/realtime.js"
+  },
+  "dependencies": {
+    "cors": "2.8.5",
+    "dotenv": "16.5.0",
+    "express": "5.1.0",
+    "firebase-admin": "^14.5.0",
+    "helmet": "8.1.0",
+    "mongodb": "6.16.0",
+    "ws": "8.18.3",
+    "zod": "3.24.4"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "10.2.3"
+  }
 }

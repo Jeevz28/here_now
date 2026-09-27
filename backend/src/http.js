@@ -1,3 +1,4 @@
+import {pushStatus} from './push.js';
 import {performanceMiddleware} from './performance.js';
 import express from 'express';
 import helmet from 'helmet';
@@ -14,6 +15,10 @@ export function createHttpApp(service,{origins=[],rateLimits=true}={}){
   app.post('/auth/login',async(req,res)=>res.json(await service.login(req.body)));
   app.use(async(req,res,next)=>{const header=req.headers.authorization||'';if(!header.startsWith('Bearer '))fail(401,'Please sign in.');req.principal=await service.authenticate(header.slice(7));next();});
   const route=(method,path,fn,status=200)=>app[method](path,async(req,res)=>res.status(status).json(await fn(req.principal,req)));
+  route('get','/push/config',()=>({enabled:!!service.pushConfigured}));
+  route('get','/push/status',p=>pushStatus(service,p));
+  route('post','/push/devices',(p,r)=>service.registerPush(p,r.body));
+  route('delete','/push/devices',(p,r)=>service.removePush(p,r.body));
   route('post','/location',(p,r)=>service.updateLocation(p,r.body));
   route('delete','/location',(p,r)=>service.revokeLocation(p,r.body));
   route('get','/state',p=>service.state(p));

@@ -1,3 +1,4 @@
+import {registerPush,removePush,enqueuePush,pushLog} from './push.js';
 import { randomBytes } from 'node:crypto';
 import { transaction } from './database.js';
 import { id,digest,fail,schemas,hashPassword,verifyPassword,age,own,anonymous,distance } from './core.js';
@@ -5,6 +6,8 @@ import { id,digest,fail,schemas,hashPassword,verifyPassword,age,own,anonymous,di
 export const LOCATION_LEASE_SECONDS=420;
 export class Service {
   constructor(client,db,{demoMode=false,clock=()=>Date.now()/1000}={}){this.client=client;this.db=db;this.demoMode=demoMode;this.clock=clock;}
+  registerPush(p,input){return registerPush(this,p,input);}
+  removePush(p,input){return removePush(this,p,input);}
   active(){return {expires:{$gt:this.clock()},checked:{$gt:this.clock()-LOCATION_LEASE_SECONDS},location:{$exists:true}};}
   async emit(t,event,users,extra={}){
     await t.insert('events',{_id:id(),event,scope:users===null?'all':'users',users:users||[],...extra,createdAt:new Date(),expiresAt:new Date(Date.now()+600000)});
@@ -97,8 +100,9 @@ export class Service {
     for(const c of chats)await this.emit(t,'chat.changed',[c.a,c.b],{conversationId:c._id});
     await this.emit(t,'profile.changed',[u._id]);return {ok:true};
   });}
-  async logout(p){return this.execute(p,true,async(t,u)=>{await this.endPresence(t,[u._id]);await t.remove('locations',{_id:u._id});await t.remove('tokens',{_id:p.hash});await this.emit(t,'session.revoked',[u._id],{tokenHash:p.hash});return {ok:true};});}
+  async logout(p){return this.execute(p,true,async(t,u)=>{await this.endPresence(t,[u._id]);await t.remove('locations',{_id:u._id});await t.remove('pushDevices',{tokenHash:p.hash});await t.remove('pushJobs',{tokenHash:p.hash});await t.remove('tokens',{_id:p.hash});await this.emit(t,'session.revoked',[u._id],{tokenHash:p.hash});return {ok:true};});}
   async deleteMe(p){return this.execute(p,true,async(t,u)=>{
+    await t.remove('pushDevices',{userId:u._id});await t.remove('pushJobs',{recipientId:u._id});
     await this.endPresence(t,[u._id]);await t.remove('locations',{_id:u._id});await t.remove('tokens',{userId:u._id});await t.remove('blocks',{$or:[{owner:u._id},{target:u._id}]});await t.remove('users',{_id:u._id});await t.remove('locationRisks',{_id:u._id});await this.emit(t,'session.revoked',[u._id]);return {ok:true};
   });}
   geo(location){return {$geoWithin:{$centerSphere:[location.coordinates,1000/6371000]}};}
@@ -286,8 +290,9 @@ export class Service {
     if(await t.count('messages',{sender:u._id,created:{$gt:this.clock()-60}})>=20)fail(429,'You can send 20 messages a minute.');
     const mid=id(),created=this.clock();await t.insert('messages',{_id:mid,conversationId:cid,sender:u._id,clientId:d.clientId,body:d.body,created});
     await t.update('conversations',{_id:cid},{$inc:{summaryRevision:1}});
+    await enqueuePush(t,c,{_id:mid,sender:u._id},this.clock());
     await this.emit(t,'chat.message',[c.a,c.b],{conversationId:cid,messageId:mid});return {id:mid,clientId:d.clientId,created};
-  });}
+  }).then(result=>{pushLog('message_committed',{messageId:result.id,conversationId:cid,senderUserId:p.id});return result;});}
   async vibe(p,cid,input){const {value}=schemas.choice.parse(input);return this.execute(p,true,async(t,u)=>{
     const c=await this.getChat(t,cid,u._id),key=c.a===u._id?'vibeA':'vibeB',wasMutual=c.vibeA&&c.vibeB;
     await this.requireLocation(t,p);if(c[key]===value)return {chat:await this.chatView(t,c,u._id)};c[key]=value;

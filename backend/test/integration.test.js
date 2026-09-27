@@ -6,9 +6,9 @@ import {MongoMemoryReplSet} from 'mongodb-memory-server';
 import WebSocket from 'ws';
 import {LOCATION_LEASE_SECONDS} from '../src/service.js';
 import {createApplication} from '../src/app.js';
-let mongo,runtime,base,folder,sequence=0;const sockets=[];
+let mongo,runtime,base,folder,sequence=0;const sockets=[];let deliveries=[],pushFailure=null;
 before(async()=>{await mkdir('.test-data',{recursive:true});folder=await mkdtemp(process.cwd()+'/.test-data/mongo-');mongo=await MongoMemoryReplSet.create({instanceOpts:[{dbPath:folder}],replSet:{count:1,args:['--nounixsocket','--setParameter','diagnosticDataCollectionEnabled=false']},binary:{version:'7.0.14'}});});
-beforeEach(async()=>{runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+(++sequence),demoMode:true,origins:['http://10.0.2.2:8000'],rateLimits:false,authTimeoutMs:300});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;});
+beforeEach(async()=>{deliveries=[];pushFailure=null;runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+(++sequence),demoMode:true,origins:['http://10.0.2.2:8000'],rateLimits:false,authTimeoutMs:300,pushIntervalMs:3600000,pushSender:async payload=>{if(pushFailure)throw pushFailure;deliveries.push(payload);return 'fcm-test-id';}});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;});
 afterEach(async()=>{for(const ws of sockets.splice(0))ws.terminate();await runtime.close();});
 after(async()=>{await mongo?.stop();if(folder)await rm(folder,{recursive:true,force:true});});
 async function api(path,{token,method='GET',body,status=200}={}){const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},...(body!==undefined?{body:JSON.stringify(body)}:{})});const data=await r.json();assert.equal(r.status,status,JSON.stringify(data));return data;}
@@ -189,4 +189,47 @@ test('direct message events are private, authoritative and keep content out of t
  const summary=await api('/conversations/'+cid+'/summary',{token:b.token});assert.equal(summary.messages,undefined);assert.equal(summary.unreadCount,1);await api('/conversations/'+cid+'/summary',{token:eve.token,status:404});
  await runtime.db.collection('locations').deleteOne({_id:b.id});
  await assert.rejects(()=>runtime.service.chatEvent({id:b.id,hash:digest(b.token)},{event:'chat.message',conversationId:cid,messageId:incoming.message.id}),e=>e.status===403);
+});
+
+const device=(u,installationId,preview=false,token='fcm-token-'+installationId+'-123456789')=>api('/push/devices',{token:u.token,method:'POST',body:{installationId,token,preview}});
+test('durable push queues once per message/device; only recipient devices receive anonymous private payloads',async()=>{
+ const {a,b,cid}=await pair();await device(a,'alice-phone');await device(b,'bob-phone');await device(b,'bob-tablet');
+ const m=await send(a,cid,'Private hello','push-client-123');await send(a,cid,'Private hello','push-client-123');
+ assert.equal(await runtime.db.collection('pushJobs').countDocuments({}),2);
+ await Promise.all([runtime.push.drain(),runtime.push.drain()]);await runtime.push.drain();assert.equal(deliveries.length,2);
+ for(const p of deliveries){assert.equal(p.data.messageId,m.id);assert.equal(p.data.recipientId,b.id);assert.equal(p.data.conversationId,cid);assert.equal(p.notification.body,'New message. Open herenow to read it.');assert.ok(!p.notification.title.includes('Alice'));assert.equal(p.android.notification.tag,m.id);assert.equal(p.android.notification.channelId,'messages');assert.ok(!('lat' in p.data));}
+});
+test('push token rotation replaces old registration and preview opt-in controls message text',async()=>{
+ const {a,b,cid}=await pair();await device(b,'bob-phone',false);await device(b,'bob-phone',true,'fresh-token-12345678901234567890');
+ assert.equal(await runtime.db.collection('pushDevices').countDocuments({userId:b.id}),1);
+ await send(a,cid,'Preview allowed','push-preview-123');await runtime.push.drain();assert.equal(deliveries[0].token,'fresh-token-12345678901234567890');assert.equal(deliveries[0].notification.body,'Preview allowed');
+ await api('/push/devices',{token:b.token,method:'DELETE',body:{installationId:'bob-phone'}});await send(a,cid,'No more pushes','push-disabled-123');await runtime.push.drain();assert.equal(deliveries.length,1);
+});
+test('read messages and ended conversations do not produce queued push; logout removes registrations',async()=>{
+ const {a,b,cid}=await pair();await device(b,'bob-phone');const m=await send(a,cid,'Already seen','push-seen-123');
+ await api('/conversations/'+cid+'/read',{token:b.token,method:'POST',body:{messageIds:[m.id]}});await runtime.push.drain();assert.equal(deliveries.length,0);
+ await send(a,cid,'Before logout','push-logout-123');await api('/auth/logout',{token:b.token,method:'POST'});await runtime.push.drain();assert.equal(deliveries.length,0);assert.equal(await runtime.db.collection('pushDevices').countDocuments({userId:b.id}),0);
+});
+test('temporary provider failure retries durable jobs; invalid tokens are removed',async()=>{
+ const {a,b,cid}=await pair();await device(b,'bob-phone');await send(a,cid,'Retry delivery','push-retry-123');pushFailure=Object.assign(Error('unavailable'),{code:'messaging/server-unavailable'});
+ await runtime.push.drain();assert.equal(await runtime.db.collection('pushJobs').countDocuments({status:'pending'}),1);pushFailure=null;await runtime.db.collection('pushJobs').updateMany({},{$set:{nextAt:new Date(0)}});await runtime.push.drain();assert.equal(deliveries.length,1);
+ await send(a,cid,'Expired token','push-invalid-123');pushFailure=Object.assign(Error('invalid'),{code:'messaging/registration-token-not-registered'});await runtime.push.drain();assert.equal(await runtime.db.collection('pushDevices').countDocuments({userId:b.id}),0);
+});
+test('revoked/foreign auth cannot remove another session push registration',async()=>{
+ const {a,b}=await pair();await device(b,'bob-phone');await api('/push/devices',{token:a.token,method:'DELETE',body:{installationId:'bob-phone'}});assert.equal(await runtime.db.collection('pushDevices').countDocuments({userId:b.id}),1);
+ await api('/auth/logout',{token:b.token,method:'POST'});await api('/push/devices',{token:b.token,method:'POST',status:401,body:{installationId:'bob-phone',token:'fcm-token-123456789012345'}});
+});
+
+test('push diagnostics retain provider ID, remain account-scoped and never expose registration tokens',async()=>{
+ const {a,b,cid}=await pair();const secret='fcm-secret-123456789012345678901234';await device(b,'bob-phone',false,secret);
+ const m=await send(a,cid,'Do not put this text in diagnostics','push-diagnostics-123');await runtime.push.drain();
+ const status=await api('/push/status',{token:b.token});assert.equal(status.registeredDevices.length,1);assert.equal(status.recent[0].outcome,'accepted');assert.equal(status.recent[0].providerMessageId,'fcm-test-id');assert.equal(status.recent[0].messageId,m.id);
+ const text=JSON.stringify(status);assert.ok(!text.includes(secret));assert.ok(!text.includes('Do not put this text'));assert.ok(!text.includes('tokenHash'));
+ const other=await api('/push/status',{token:a.token});assert.equal(other.registeredDevices.length,0);assert.equal(other.recent.length,0);
+ assert.equal(deliveries[0].data.senderId,a.id);
+});
+test('push diagnostics identify provider rejection and a skipped already-read message',async()=>{
+ const {a,b,cid}=await pair();await device(b,'bob-phone');await send(a,cid,'Mismatch','push-mismatch-123');pushFailure=Object.assign(Error('FCM project mismatch'),{code:'messaging/mismatched-credential'});await runtime.push.drain();
+ let status=await api('/push/status',{token:b.token});assert.equal(status.recent[0].errorCode,'messaging/mismatched-credential');assert.equal(status.recent[0].providerMessageId,null);
+ pushFailure=null;const m=await send(a,cid,'Read first','push-read-trace-123');await api('/conversations/'+cid+'/read',{token:b.token,method:'POST',body:{messageIds:[m.id]}});await runtime.push.drain();status=await api('/push/status',{token:b.token});const skipped=status.recent.find(x=>x.messageId===m.id);assert.equal(skipped.outcome,'skipped');assert.equal(skipped.reason,'message_read_or_unavailable');
 });
