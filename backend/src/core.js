@@ -12,7 +12,7 @@ export const schemas = {
   credentials: z.object({ email: z.string().trim().email().max(254).transform(s => s.toLowerCase()), password: z.string().min(10).max(128) }),
   profile: z.object({ name: text(1, 30), interests: text(0, 120) }),
   location: z.object({lat:z.number().finite().min(-90).max(90),lon:z.number().finite().min(-180).max(180),accuracy:z.number().finite().min(0),timestamp:z.number().finite(),mocked:z.boolean(),servicesEnabled:z.boolean(),permissionGranted:z.boolean()}),
-  presence: z.object({placeId:text(1,80).nullable().default(null),category:z.enum(['Friends','Dating','Sports','Pets','Social','Gaming']),minutes:z.union([z.literal(30),z.literal(60),z.literal(120)]).default(60)}),
+  presence: z.object({placeId:text(1,80).nullable().default(null),category:z.enum(['Friends','Dating','Sports','Pets','Social','Gaming']),minutes:z.union([z.literal(0),z.literal(30),z.literal(60),z.literal(120)]).default(60)}),
   target: z.object({target:identifier}),
   choice: z.object({value:z.boolean()}),
   message: z.object({body:text(1,1000),clientId:z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/)}),

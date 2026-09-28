@@ -29,6 +29,7 @@ export function createHttpApp(service,{origins=[],rateLimits=true}={}){
   route('get','/places',p=>service.places(p));
   route('post','/presence',(p,r)=>service.enter(p,r.body));
   route('post','/presence/heartbeat',(p,r)=>service.heartbeat(p,r.body));
+  route('post','/presence/extend',(p,r)=>service.extendLive(p,r.body));
   route('delete','/presence',p=>service.leave(p));
   route('get','/circle',p=>service.circle(p));
   route('get','/conversations',p=>service.chats(p));
@@ -37,7 +38,8 @@ export function createHttpApp(service,{origins=[],rateLimits=true}={}){
   route('get','/conversations/:cid/summary',(p,r)=>service.chatSummary(p,r.params.cid));
   route('post','/conversations/:cid/read',(p,r)=>service.readMessages(p,r.params.cid,r.body));
   route('delete','/conversations/:cid',(p,r)=>service.endChat(p,r.params.cid));
-  route('get','/conversations/:cid/messages',(p,r)=>service.olderMessages(p,r.params.cid,r.query.before));
+  route('get','/conversations/:cid/sync',(p,r)=>service.syncChat(p,r.params.cid,r.query.after));
+  route('get','/conversations/:cid/messages',(p,r)=>service.olderMessages(p,r.params.cid,r.query.before,r.query.beforeId));
   route('post','/conversations/:cid/messages',(p,r)=>service.sendMessage(p,r.params.cid,r.body),201);
   route('post','/conversations/:cid/vibe',(p,r)=>service.vibe(p,r.params.cid,r.body));
   route('post','/conversations/:cid/ready',(p,r)=>service.ready(p,r.params.cid,r.body));

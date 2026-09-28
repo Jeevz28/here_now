@@ -54,8 +54,8 @@ test('WebSocket chat delivers only to participants and denies third-party comman
 test('retry after reconnect and HTTP fallback create no duplicate messages',async()=>{const {a,b,cid}=await pair(),sa=wsClient(a.token);await sa.ready;const d={body:'Send once',clientId:'retry-msg-001'};const first=await sa.command('chat.send',cid,d);sa.ws.terminate();const again=wsClient(a.token);await again.ready;assert.equal((await again.command('chat.send',cid,d)).data.id,first.data.id);await send(a,cid,d.body,d.clientId);assert.equal((await api('/conversations/'+cid,{token:b.token})).messages.length,1);await send(a,cid,'Different',d.clientId,409);});
 test('malformed frames and empty/oversized messages are rejected',async()=>{const {a,cid}=await pair(),sa=wsClient(a.token);await sa.ready;assert.equal((await sa.command('chat.send',cid,{body:' ',clientId:'blank-msg-1'},'error')).status,422);sa.ws.send('{broken');assert.equal((await sa.next(d=>d.type==='error')).status,422);await send(a,cid,'x'.repeat(1001),'long-msg-001',422);});
 test('private vibes, mutual reveal, explicit meetup consent and withdrawal',async()=>{const {a,b,cid}=await pair(),sa=wsClient(a.token),sb=wsClient(b.token);await Promise.all([sa.ready,sb.ready]);await choice(a,cid,'ready',true,409);await sa.command('chat.vibe',cid,{value:true});await sa.next(event(cid,'chat.changed'));assert.equal(sb.buffer.some(event(cid,'chat.changed')),false);assert.equal((await api('/conversations/'+cid,{token:b.token})).person.name,undefined);await sb.command('chat.vibe',cid,{value:true});await sa.next(event(cid,'chat.changed'));assert.equal((await api('/conversations/'+cid,{token:a.token})).person.name,'Bob');await sa.command('meetup.ready',cid,{value:true});assert.equal((await api('/conversations/'+cid,{token:b.token})).meetup,null);await sb.command('meetup.ready',cid,{value:true});await sa.next(event(cid,'meetup.changed'));const v=await api('/conversations/'+cid,{token:a.token});assert.equal(v.meetup.code.length,6);assert.equal(v.meetup.lat,undefined);await sb.command('meetup.ready',cid,{value:false});assert.equal((await api('/conversations/'+cid,{token:a.token})).meetup,null);await sa.command('chat.vibe',cid,{value:false});assert.equal((await api('/conversations/'+cid,{token:b.token})).person.name,undefined);});
-test('presence departure pushes chat-ended and circle updates',async()=>{const {a,b,cid}=await pair(),sa=wsClient(a.token);await sa.ready;await send(a,cid,'Temporary','temporary-1');await api('/presence',{token:b.token,method:'DELETE'});await sa.next(event(cid,'chat.ended'));await sa.next(d=>d.event==='circle.changed');assert.deepEqual((await api('/circle',{token:a.token})).people,[]);await api('/conversations/'+cid,{token:a.token,status:404});assert.equal(await runtime.db.collection('messages').countDocuments({conversationId:cid}),0);});
-test('stale presence expires even while a WebSocket remains open',async()=>{const {a,b,cid}=await pair(),sa=wsClient(a.token);await sa.ready;await runtime.db.collection('presence').updateOne({_id:b.id},{$set:{checked:runtime.service.clock()-LOCATION_LEASE_SECONDS-1}});await runtime.service.cleanup();await sa.next(event(cid,'chat.ended'));assert.deepEqual((await api('/circle',{token:a.token})).people,[]);});
+test('presence departure preserves chat and message history while removing discovery',async()=>{const {a,b,cid}=await pair(),sa=wsClient(a.token);await sa.ready;await send(a,cid,'Keep this','keep-chat-1');await api('/presence',{token:b.token,method:'DELETE'});await sa.next(d=>d.event==='circle.changed');assert.deepEqual((await api('/circle',{token:a.token})).people,[]);assert.equal((await api('/conversations/'+cid,{token:a.token})).messages.length,1);await send(b,cid,'Still here in chat','after-leave-1');assert.equal(sa.buffer.some(event(cid,'chat.ended')),false);});
+test('stale presence expires without ending established conversation',async()=>{const {a,b,cid}=await pair();await runtime.db.collection('presence').updateOne({_id:b.id},{$set:{checked:runtime.service.clock()-LOCATION_LEASE_SECONDS-1}});await runtime.service.cleanup();assert.deepEqual((await api('/circle',{token:a.token})).people,[]);await api('/conversations/'+cid,{token:b.token});});
 test('heartbeats cannot extend the original session deadline',async()=>{const a=await user('Alice');await enter(a,{minutes:30});const original=await runtime.db.collection('presence').findOne({_id:a.id});await api('/presence/heartbeat',{token:a.token,method:'POST',body:live});assert.equal((await runtime.db.collection('presence').findOne({_id:a.id})).expires,original.expires);await runtime.db.collection('presence').updateOne({_id:a.id},{$set:{expires:runtime.service.clock()-1}});await api('/presence/heartbeat',{token:a.token,method:'POST',body:live,status:409});assert.equal((await api('/circle',{token:a.token})).presence,null);});
 test('meetup expiry pushes updates and requires fresh mutual consent',async()=>{const {a,b,cid}=await pair();for(const u of [a,b])await choice(u,cid,'vibe');for(const u of [a,b])await choice(u,cid,'ready');const sa=wsClient(a.token);await sa.ready;await runtime.db.collection('conversations').updateOne({_id:cid},{$set:{codeExpires:runtime.service.clock()-1}});await runtime.service.cleanup();await sa.next(event(cid,'meetup.changed'));const v=await api('/conversations/'+cid,{token:a.token});assert.equal(v.ready,false);assert.equal(v.meetup,null);await choice(a,cid,'ready');assert.equal((await api('/conversations/'+cid,{token:a.token})).meetup,null);});
 test('transactional joins cannot overfill the last activity slot',async()=>{const {a,b}=await pair(),c=await user('Charlie');await enter(c);const {id}=await api('/activities',{token:a.token,method:'POST',body:{title:'Two-player game',capacity:2},status:201});const results=await Promise.all([b,c].map(u=>fetch(base+'/activities/'+id+'/join',{method:'POST',headers:{Authorization:'Bearer '+u.token}})));assert.deepEqual(results.map(r=>r.status).sort(),[200,409]);assert.equal((await api('/activities',{token:a.token}))[0].count,2);});
@@ -67,7 +67,7 @@ test('account deletion cascades and operator bans revoke sockets',async()=>{cons
 test('invalid and expired tokens cannot authenticate WebSockets',async()=>{const s=wsClient('',{auth:false});await s.ready;s.ws.send(JSON.stringify({type:'auth',token:'invalid-token-invalid-token'}));await s.next(d=>d.type==='auth.expired');const a=await user('Alice');await runtime.db.collection('tokens').updateMany({userId:a.id},{$set:{expiresAt:new Date(0)}});const e=wsClient('',{auth:false});await e.ready;e.ws.send(JSON.stringify({type:'auth',token:a.token}));await e.next(d=>d.type==='auth.expired');});
 test('authentication deadline and cross-origin socket protection',async()=>{const s=wsClient('',{auth:false});await s.ready;assert.equal(await new Promise(resolve=>s.ws.once('close',resolve)),4401);const ws=new WebSocket(base.replace('http:','ws:')+'/ws',{origin:'https://untrusted.example'});sockets.push(ws);ws.on('error',()=>{});assert.equal(await new Promise(resolve=>ws.on('unexpected-response',(req,res)=>{resolve(res.statusCode);req.destroy();})),403);});
 test('reconnecting clients can fetch messages missed while offline',async()=>{const {a,b,cid}=await pair(),sb=wsClient(b.token);await sb.ready;sb.ws.terminate();await send(a,cid,'While offline','offline-001');const r=wsClient(b.token);await r.ready;assert.equal((await api('/conversations/'+cid,{token:b.token})).messages[0].body,'While offline');});
-test('venue switches invalidate old conversations',async()=>{const {a,b,cid}=await pair();runtime.service.clock=()=>Date.now()/1000+500;await runtime.db.collection('locations').deleteOne({_id:b.id});const timestamp=Date.now()+500000;await fix(b,55.8612,-4.2502,{timestamp});await api('/presence',{token:b.token,method:'POST',body:{...live,demo:false,placeId:'george-square'}});await api('/conversations/'+cid,{token:a.token,status:404});await api('/conversations',{token:a.token,method:'POST',body:{target:b.id},status:403});});
+test('venue switches preserve established conversations',async()=>{const {a,b,cid}=await pair();runtime.service.clock=()=>Date.now()/1000+500;await runtime.db.collection('locations').deleteOne({_id:b.id});const timestamp=Date.now()+500000;await fix(b,55.8612,-4.2502,{timestamp});await api('/presence',{token:b.token,method:'POST',body:{...live,demo:false,placeId:'george-square'}});await api('/conversations/'+cid,{token:a.token});await api('/conversations',{token:a.token,method:'POST',body:{target:b.id},status:403});});
 test('MongoDB change streams deliver between separate Node instances',async()=>{const {a,b,cid}=await pair();const second=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+sequence,demoMode:true,rateLimits:false});await second.listen(0,'127.0.0.1');try{const sb=wsClient(b.token);await sb.ready;await second.service.sendMessage(await second.service.authenticate(a.token),cid,{body:'Across Node instances',clientId:'cross-node-1'});await sb.next(event(cid,'chat.message'));}finally{await second.close();}});
 test('accounts and messages persist across API restarts',async()=>{const {a,b,cid}=await pair();await send(a,cid,'Persisted in MongoDB','persist-001');await runtime.close();runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+sequence,demoMode:true,rateLimits:false});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;assert.equal((await api('/conversations/'+cid,{token:b.token})).messages[0].body,'Persisted in MongoDB');});
 test('chat rate limits apply across both transports',async()=>{const {a,cid}=await pair(),s=wsClient(a.token);await s.ready;for(let i=0;i<20;i++)await s.command('chat.send',cid,{body:'Message '+i,clientId:'rate-msg-'+i});assert.equal((await s.command('chat.send',cid,{body:'Too many',clientId:'rate-msg-21'},'error')).status,429);await send(a,cid,'HTTP too','rate-http-1',429);});
@@ -112,13 +112,13 @@ test('location is bound to the authenticated sign-in; old samples cannot refresh
  await fix(a,55.8685,-4.284,{timestamp:old.timestamp},403);
 });
 
-test('moving beyond 1 km ends nearby chats for both transports',async()=>{
+test('moving beyond 1 km preserves established chats',async()=>{
  const a=await user('Alpha'),b=await user('Beta');
  for(const u of [a,b]){await fix(u,0,0);await api('/presence',{token:u.token,method:'POST',body:{category:'Social'}});}
  const {id}=await api('/conversations',{token:a.token,method:'POST',body:{target:b.id},status:201});
  const sb=wsClient(b.token);await sb.ready;const now=Date.now();runtime.service.clock=()=>now/1000+30;
- await fix(a,0.01,0,{timestamp:now+30000});await sb.next(event(id,'chat.ended'));
- await api('/conversations/'+id,{token:a.token,status:404});assert.equal(await runtime.db.collection('conversations').findOne({_id:id}),null);
+ await fix(a,0.01,0,{timestamp:now+30000});
+ await api('/conversations/'+id,{token:a.token});assert.ok(await runtime.db.collection('conversations').findOne({_id:id}));await send(a,id,'Still connected','moving-chat-1');
 });
 
 test('five-minute location refresh preserves chats and replaces a single coordinate record',async()=>{
@@ -129,7 +129,7 @@ test('five-minute location refresh preserves chats and replaces a single coordin
  assert.equal((await api('/conversations/'+cid,{token:a.token})).messages[0].body,'Keep this while locked');
  assert.equal(await runtime.db.collection('locations').countDocuments({_id:a.id}),1);
  runtime.service.clock=()=>now/1000+301+LOCATION_LEASE_SECONDS+1;await runtime.service.cleanup();
- assert.equal(await runtime.db.collection('messages').countDocuments({conversationId:cid}),0);
+ assert.equal(await runtime.db.collection('messages').countDocuments({conversationId:cid}),1);
  assert.equal(await runtime.db.collection('locations').countDocuments({_id:a.id}),0);
 });
 test('an old background worker cannot revoke or update a replacement session',async()=>{
@@ -188,7 +188,7 @@ test('direct message events are private, authoritative and keep content out of t
  const outbox=await runtime.db.collection('events').find({conversationId:cid}).toArray();assert.equal(JSON.stringify(outbox).includes('Private event content'),false);
  const summary=await api('/conversations/'+cid+'/summary',{token:b.token});assert.equal(summary.messages,undefined);assert.equal(summary.unreadCount,1);await api('/conversations/'+cid+'/summary',{token:eve.token,status:404});
  await runtime.db.collection('locations').deleteOne({_id:b.id});
- await assert.rejects(()=>runtime.service.chatEvent({id:b.id,hash:digest(b.token)},{event:'chat.message',conversationId:cid,messageId:incoming.message.id}),e=>e.status===403);
+ assert.ok(await runtime.service.chatEvent({id:b.id,hash:digest(b.token)},{event:'chat.message',conversationId:cid,messageId:incoming.message.id}));
 });
 
 const device=(u,installationId,preview=false,token='fcm-token-'+installationId+'-123456789')=>api('/push/devices',{token:u.token,method:'POST',body:{installationId,token,preview}});
@@ -232,4 +232,52 @@ test('push diagnostics identify provider rejection and a skipped already-read me
  const {a,b,cid}=await pair();await device(b,'bob-phone');await send(a,cid,'Mismatch','push-mismatch-123');pushFailure=Object.assign(Error('FCM project mismatch'),{code:'messaging/mismatched-credential'});await runtime.push.drain();
  let status=await api('/push/status',{token:b.token});assert.equal(status.recent[0].errorCode,'messaging/mismatched-credential');assert.equal(status.recent[0].providerMessageId,null);
  pushFailure=null;const m=await send(a,cid,'Read first','push-read-trace-123');await api('/conversations/'+cid+'/read',{token:b.token,method:'POST',body:{messageIds:[m.id]}});await runtime.push.drain();status=await api('/push/status',{token:b.token});const skipped=status.recent.find(x=>x.messageId===m.id);assert.equal(skipped.outcome,'skipped');assert.equal(skipped.reason,'message_read_or_unavailable');
+});
+
+test('resume sync returns only missed messages, retries do not advance sequence, and validates access',async()=>{
+ const {a,b,cid}=await pair();
+ const initial=await api('/conversations/'+cid,{token:b.token});assert.equal(initial.syncSeq,0);
+ const sent=await send(a,cid,'Before lock','resume-001');
+ const snapshot=await api('/conversations/'+cid,{token:b.token});assert.equal(snapshot.syncSeq,1);
+ await send(a,cid,'Before lock','resume-001');
+ await Promise.all([send(a,cid,'While locked one','resume-002'),send(b,cid,'While locked two','resume-003')]);
+ const delta=await api('/conversations/'+cid+'/sync?after=1',{token:b.token});
+ assert.equal(delta.syncSeq,3);assert.equal(delta.messages.length,2);assert.equal(delta.hasMore,false);assert.ok(delta.messages.every(m=>m.id!==sent.id));
+ const empty=await api('/conversations/'+cid+'/sync?after=3',{token:b.token});assert.equal(empty.messages.length,0);
+ const eve=await user('Eve');await api('/conversations/'+cid+'/sync?after=0',{token:eve.token,status:404});
+ await api('/conversations/'+cid+'/sync?after=999',{token:b.token,status:409});
+ await api('/conversations/'+cid+'/sync?after=NaN',{token:b.token,status:422});
+ await api('/conversations/'+cid,{token:a.token,method:'DELETE'});
+ await api('/conversations/'+cid+'/sync?after=3',{token:b.token,status:404});
+});
+test('resume sync pages without skipping equal-timestamp messages; cached oldest ID paginates correctly',async()=>{
+ const {a,b,cid}=await pair();const created=Date.now()/1000;
+ const rows=Array.from({length:205},(_,i)=>({_id:(i+1).toString(16).padStart(32,'0'),conversationId:cid,sender:a.id,clientId:'seed-'+i,body:'Message '+i,created,seq:i+1}));
+ await runtime.db.collection('messages').insertMany(rows);await runtime.db.collection('conversations').updateOne({_id:cid},{$set:{messageSeq:205}});
+ let after=0,ids=[];for(let i=0;i<3;i++){const d=await api('/conversations/'+cid+'/sync?after='+after,{token:b.token});ids.push(...d.messages.map(m=>m.id));after=d.syncSeq;assert.equal(d.hasMore,i<2);}
+ assert.equal(after,205);assert.equal(new Set(ids).size,205);
+ const older=await api('/conversations/'+cid+'/messages?beforeId='+rows[5]._id,{token:b.token});assert.equal(older.messages.length,5);assert.equal(older.hasMore,false);
+});
+
+test('30 minute discoverability expiry preserves HTTP/WS messaging, history, read state and push',async()=>{
+ const {a,b,cid}=await pair();await device(b,'expired-live-phone');await send(a,cid,'Before timer','timer-before-1');
+ await runtime.db.collection('presence').updateMany({},{$set:{expires:runtime.service.clock()-1}});await runtime.service.cleanup();
+ assert.equal((await api('/state',{token:b.token})).circle.presence,null);assert.equal((await api('/state',{token:b.token})).chats[0].id,cid);
+ await runtime.db.collection('locations').deleteMany({});
+ const sb=wsClient(b.token);await sb.ready;const ack=await sb.command('chat.send',cid,{body:'After timer','timer':'ignored',clientId:'timer-after-1'});assert.ok(ack.data.id);
+ const history=await api('/conversations/'+cid,{token:a.token});assert.equal(history.messages.length,2);
+ await send(a,cid,'Push after expiry','timer-push-1');await runtime.push.drain();assert.ok(deliveries.some(d=>d.data.conversationId===cid));
+});
+test('Until I leave refreshes safety lease, then expires stale presence without deleting chat',async()=>{
+ const {a,b,cid}=await pair();await enter(a,{minutes:0});const initial=await runtime.db.collection('presence').findOne({_id:a.id});assert.equal(initial.untilLeave,true);
+ const now=Date.now();runtime.service.clock=()=>now/1000+300;
+ await fix(a,55.8685,-4.284,{timestamp:now+300000,liveSessionId:initial.liveSessionId});
+ const fresh=await runtime.db.collection('presence').findOne({_id:a.id});assert.ok(fresh.expires>initial.expires+290);
+ runtime.service.clock=()=>fresh.expires+1;await runtime.service.cleanup();assert.equal(await runtime.db.collection('presence').findOne({_id:a.id}),null);await api('/conversations/'+cid,{token:a.token});
+});
+test('Live extension adds thirty minutes once and rejects stale session identifiers',async()=>{
+ const a=await user('Extension');await enter(a,{minutes:30});const before=await runtime.db.collection('presence').findOne({_id:a.id});
+ const body={liveSessionId:before.liveSessionId,requestId:'extension-retry-1'};
+ const first=await api('/presence/extend',{token:a.token,method:'POST',body});const retry=await api('/presence/extend',{token:a.token,method:'POST',body});assert.equal(first.expires,before.expires+1800);assert.equal(retry.expires,first.expires);
+ await api('/presence/extend',{token:a.token,method:'POST',body:{...body,liveSessionId:'stale-session'},status:409});
 });

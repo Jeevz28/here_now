@@ -31,6 +31,7 @@ export async function connectDatabase(uri, name) {
   await db.collection('messages').createIndex({conversationId:1,sender:1,read:1});
   await db.collection('messages').createIndex({conversationId:1,read:1,sender:1});
   await db.collection('messages').createIndex({sender:1,created:1});
+  await db.collection('messages').createIndex({conversationId:1,seq:1});
   await db.collection('activities').createIndex({place_id:1});
   await db.collection('blocks').createIndex({owner:1,target:1},{unique:true});
   await db.collection('reports').createIndex({expiresAt:1},{expireAfterSeconds:0});

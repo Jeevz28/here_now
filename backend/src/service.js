@@ -71,14 +71,9 @@ export class Service {
   async endPresence(t,ids){
     if(!ids.length)return;
     const old=await t.all('presence',{_id:{$in:ids}});
-    const chats=await t.all('conversations',{$or:[{a:{$in:ids}},{b:{$in:ids}}]});
-    const cids=chats.map(c=>c._id);
-    await t.remove('messages',{conversationId:{$in:cids}});
-    await t.remove('conversations',{_id:{$in:cids}});
     await t.remove('activities',{owner:{$in:ids}});
     await t.updateMany('activities',{},{$pull:{members:{$in:ids}}});
     await t.remove('presence',{_id:{$in:ids}});
-    for(const c of chats)await this.emit(t,'chat.ended',[c.a,c.b],{conversationId:c._id});
     await this.emit(t,'presence.ended',ids);
     await this.circleEvent(t,old.map(p=>p.place_id));
   }
@@ -103,6 +98,8 @@ export class Service {
   async logout(p){return this.execute(p,true,async(t,u)=>{await this.endPresence(t,[u._id]);await t.remove('locations',{_id:u._id});await t.remove('pushDevices',{tokenHash:p.hash});await t.remove('pushJobs',{tokenHash:p.hash});await t.remove('tokens',{_id:p.hash});await this.emit(t,'session.revoked',[u._id],{tokenHash:p.hash});return {ok:true};});}
   async deleteMe(p){return this.execute(p,true,async(t,u)=>{
     await t.remove('pushDevices',{userId:u._id});await t.remove('pushJobs',{recipientId:u._id});
+    const chats=await t.all('conversations',{$or:[{a:u._id},{b:u._id}]});
+    await t.remove('messages',{conversationId:{$in:chats.map(c=>c._id)}});await t.remove('conversations',{_id:{$in:chats.map(c=>c._id)}});for(const c of chats)await this.emit(t,'chat.ended',[c.a,c.b],{conversationId:c._id});
     await this.endPresence(t,[u._id]);await t.remove('locations',{_id:u._id});await t.remove('tokens',{userId:u._id});await t.remove('blocks',{$or:[{owner:u._id},{target:u._id}]});await t.remove('users',{_id:u._id});await t.remove('locationRisks',{_id:u._id});await this.emit(t,'session.revoked',[u._id]);return {ok:true};
   });}
   geo(location){return {$geoWithin:{$centerSphere:[location.coordinates,1000/6371000]}};}
@@ -141,14 +138,11 @@ export class Service {
       if(here){
         const place=here.place_id?await t.one('places',{_id:here.place_id}):null;
         if(here.tokenHash!==p.hash||(here.place_id&&(!place||distance(d.lat,d.lon,place.lat,place.lon)>Math.min(place.radius,1000)))){await this.endPresence(t,[u._id]);ended=true;}
-        else {await t.update('presence',{_id:u._id},{$set:{location:loc.location,checked:now}});await this.circleEvent(t,[here.place_id]);
-          for(const c of await t.all('conversations',{$or:[{a:u._id},{b:u._id}]})){
-            const other=await t.one('presence',{_id:c.a===u._id?c.b:c.a,...this.active()});
-            if(!this.closeEnough(loc,other)){await t.remove('messages',{conversationId:c._id});await t.remove('conversations',{_id:c._id});await this.emit(t,'chat.ended',[c.a,c.b],{conversationId:c._id});}
-          }
+        else {await t.update('presence',{_id:u._id},{$set:{location:loc.location,checked:now,...(here.untilLeave?{expires:now+LOCATION_LEASE_SECONDS}:{})}});await this.circleEvent(t,[here.place_id]);
+
         }
       }
-      return {status:'trusted',expiresIn:LOCATION_LEASE_SECONDS,presenceEnded:ended};
+      return {status:'trusted',expiresIn:LOCATION_LEASE_SECONDS,presenceEnded:ended,liveExpires:here&&!ended?(here.untilLeave?now+LOCATION_LEASE_SECONDS:here.expires):undefined};
     });
     if(result.status!=='trusted')fail(403,result.detail);
     return result;
@@ -186,8 +180,8 @@ export class Service {
   }
   async enter(p,input){const d=schemas.presence.parse(input);if(input.demo)fail(403,'Demo location bypass is no longer supported.');return this.execute(p,true,async(t,u)=>{
     const loc=await this.requireLocation(t,p);await this.verifyPlace(t,d.placeId,loc);await this.endPresence(t,[u._id]);
-    const sessionId=id(),expiry=this.clock()+d.minutes*60;
-    await t.insert('presence',{_id:u._id,user_id:u._id,place_id:d.placeId,category:d.category,expires:expiry,checked:loc.checked,location:loc.location,liveSessionId:sessionId,tokenHash:p.hash});
+    const sessionId=id(),expiry=this.clock()+(d.minutes===0?LOCATION_LEASE_SECONDS:d.minutes*60);
+    await t.insert('presence',{_id:u._id,user_id:u._id,place_id:d.placeId,category:d.category,untilLeave:d.minutes===0,expires:expiry,checked:loc.checked,location:loc.location,liveSessionId:sessionId,tokenHash:p.hash});
     await this.circleEvent(t,[d.placeId]);return {ok:true,liveSessionId:sessionId,expires:expiry};
   });}
   async heartbeat(p,input){return this.execute(p,true,async(t,u)=>{
@@ -195,19 +189,27 @@ export class Service {
     if(here.tokenHash!==p.hash)fail(403,'Live session belongs to another sign-in.');
     await this.verifyPlace(t,here.place_id,loc);await t.update('presence',{_id:u._id},{$set:{checked:loc.checked,location:loc.location}});return {ok:true};
   });}
+  async extendLive(p,input){return this.execute(p,true,async(t,u)=>{
+    const here=await this.live(t,u._id);await this.requireLocation(t,p);
+    if(here.tokenHash!==p.hash||input.liveSessionId!==here.liveSessionId)fail(409,'This Live session has changed.');
+    if(typeof input.requestId!=='string'||input.requestId.length<8||input.requestId.length>100)fail(422,'Invalid extension request.');
+    if(here.untilLeave)return {expires:here.expires};
+    if((here.extensions||[]).includes(input.requestId))return {expires:here.expires};
+    if((here.extensions||[]).length>=48)fail(409,'Start a new Live session to continue discovery.');
+    const expires=here.expires+1800;await t.update('presence',{_id:u._id},{$set:{expires},$push:{extensions:input.requestId}});await this.emit(t,'presence.changed',[u._id]);return {expires};
+  });}
   async leave(p){return this.execute(p,true,async(t,u)=>{await this.endPresence(t,[u._id]);return {ok:true};});}
   async circleView(t,uid){
     const here=await t.one('presence',{_id:uid,...this.active()});if(!here)return {presence:null,people:[]};
     let people=await this.nearbyPeople(t,uid,here,here.category);
     if(here.place_id){const members=await t.all('presence',{place_id:here.place_id,...this.active()});const ids=new Set(members.map(x=>x._id));people=people.filter(x=>ids.has(x.id));}
-    const {user_id,place_id,category,expires,checked,liveSessionId}=here;
-    return {presence:{user_id,place_id,category,expires,checked,liveSessionId},people};
+    const {user_id,place_id,category,expires,checked,liveSessionId,untilLeave}=here;
+    return {presence:{user_id,place_id,category,expires,checked,liveSessionId,untilLeave:!!untilLeave},people};
   }
   async circle(p){return this.execute(p,false,async(t,u)=>{if(!await this.locationFor(t,p))return {presence:null,people:[]};return this.circleView(t,u._id);});}
   async getChat(t,cid,uid){
     const c=await t.one('conversations',{_id:cid,$or:[{a:uid},{b:uid}]});if(!c)fail(404,'This temporary conversation has ended.');
-    const a=await t.one('presence',{_id:c.a,...this.active()}),b=await t.one('presence',{_id:c.b,...this.active()});
-    if(!a||!b||!this.closeEnough(a,b)||await this.blocked(t,c.a,c.b))fail(404,'This temporary conversation has ended.');
+    if(await this.blocked(t,c.a,c.b)||await t.count('users',{_id:{$in:[c.a,c.b]},banned:false})!==2)fail(404,'This conversation is unavailable.');
     return c;
   }
   chatDTO(c,uid,other,place,latest,unreadCount){
@@ -223,7 +225,7 @@ export class Service {
     const latest=await t.all('messages',{conversationId:c._id},{sort:{created:-1,_id:-1},limit:1,projection:{body:1,created:1,sender:1}});
     const unread=await t.count('messages',{conversationId:c._id,read:{$ne:true},sender:{$ne:uid}});
     const result=this.chatDTO(c,uid,other,place,latest[0],unread);
-    if(withMessages)Object.assign(result,await this.messagePage(t,c._id,uid));return result;
+    if(withMessages)Object.assign(result,await this.messagePage(t,c._id,uid),{syncSeq:c.messageSeq||0});return result;
   }
   async messagePage(t,cid,uid,before){
     let filter={conversationId:cid};
@@ -235,7 +237,7 @@ export class Service {
     const page=rows.slice(0,50),last=page.at(-1);
     return {messages:page.reverse().map(m=>({id:m._id,body:m.body,created:m.created,mine:m.sender===uid,clientId:m.clientId})),hasMore,nextCursor:hasMore&&last?Buffer.from(JSON.stringify({created:last.created,id:last._id})).toString('base64url'):null};
   }
-  async olderMessages(p,cid,before){return this.execute(p,false,async(t,u)=>{await this.getChat(t,cid,u._id);await this.requireLocation(t,p);return this.messagePage(t,cid,u._id,before);});}
+  async olderMessages(p,cid,before,beforeId){return this.execute(p,false,async(t,u)=>{await this.getChat(t,cid,u._id);if(beforeId){const anchor=await t.one('messages',{_id:beforeId,conversationId:cid});if(!anchor)fail(422,'Message anchor unavailable.');before=Buffer.from(JSON.stringify({created:anchor.created,id:anchor._id})).toString('base64url');}return this.messagePage(t,cid,u._id,before);});}
   async chatList(t,uid){
     const chats=await t.aggregate('conversations',[
       {$match:{$or:[{a:uid},{b:uid}]}},
@@ -243,20 +245,30 @@ export class Service {
     ]);
     if(!chats.length)return [];
     const ids=[...new Set(chats.flatMap(c=>[c.a,c.b]))];
-    const presence=new Map((await t.all('presence',{_id:{$in:ids},...this.active()})).map(p=>[p._id,p]));
+    
     const blocked=await this.blockedIds(t,uid);
-    const eligible=chats.filter(c=>!blocked.has(c.a===uid?c.b:c.a)&&this.closeEnough(presence.get(c.a),presence.get(c.b)));
+    const eligible=chats.filter(c=>!blocked.has(c.a===uid?c.b:c.a));
     if(!eligible.length)return [];
-    const users=new Map((await t.all('users',{_id:{$in:ids}},{projection:{name:1,alias:1,dob:1,gender:1,interests:1}})).map(u=>[u._id,u]));
+    const users=new Map((await t.all('users',{_id:{$in:ids},banned:false},{projection:{name:1,alias:1,dob:1,gender:1,interests:1}})).map(u=>[u._id,u]));
     const places=new Map((await t.all('places',{_id:{$in:[...new Set(eligible.filter(c=>c.code&&c.codeExpires>this.clock()).map(c=>c.place_id))]}},{projection:{landmark:1}})).map(p=>[p._id,p]));
     const unread=new Map((await t.aggregate('messages',[{$match:{conversationId:{$in:eligible.map(c=>c._id)},read:{$ne:true},sender:{$ne:uid}}},{$group:{_id:'$conversationId',count:{$sum:1}}}])).map(x=>[x._id,x.count]));
     return eligible.filter(c=>users.has(c.a===uid?c.b:c.a)).map(c=>this.chatDTO(c,uid,users.get(c.a===uid?c.b:c.a),places.get(c.place_id),c.latest[0],unread.get(c._id)||0));
   }
-  async chats(p){return this.execute(p,false,async(t,u)=>await this.locationFor(t,p)?this.chatList(t,u._id):[]);}
-  async chat(p,cid){return this.execute(p,false,async(t,u)=>{const c=await this.getChat(t,cid,u._id);await this.requireLocation(t,p);return this.chatView(t,c,u._id,true);});}
-  async chatSummary(p,cid){return this.execute(p,false,async(t,u)=>{const c=await this.getChat(t,cid,u._id);await this.requireLocation(t,p);return this.chatView(t,c,u._id);});}
+  async chats(p){return this.execute(p,false,async(t,u)=>this.chatList(t,u._id));}
+  async chat(p,cid){return this.execute(p,false,async(t,u)=>{const c=await this.getChat(t,cid,u._id);return this.chatView(t,c,u._id,true);});}
+  async syncChat(p,cid,after){
+    if(typeof after!=='string'||!/^\d+$/.test(after)||!Number.isSafeInteger(Number(after)))fail(422,'Invalid sync cursor.');
+    return this.execute(p,false,async(t,u)=>{
+      const c=await this.getChat(t,cid,u._id);
+      const high=c.messageSeq||0;if(Number(after)>high)fail(409,'Refresh this conversation.');
+      const rows=await t.all('messages',{conversationId:cid,seq:{$gt:Number(after),$lte:high}},{sort:{seq:1},limit:101});
+      const page=rows.slice(0,100),hasMore=rows.length>100;
+      return {chat:await this.chatView(t,c,u._id),messages:page.map(m=>({id:m._id,clientId:m.clientId,body:m.body,created:m.created,mine:m.sender===u._id})),syncSeq:hasMore?page.at(-1).seq:high,hasMore};
+    });
+  }
+  async chatSummary(p,cid){return this.execute(p,false,async(t,u)=>{const c=await this.getChat(t,cid,u._id);return this.chatView(t,c,u._id);});}
   async chatEvent(p,event){return this.execute(p,false,async(t,u)=>{
-    const c=await this.getChat(t,event.conversationId,u._id);await this.requireLocation(t,p);
+    const c=await this.getChat(t,event.conversationId,u._id);
     if(!['chat.message','chat.read'].includes(event.event))return {chat:await this.chatView(t,c,u._id)};
     const unreadCount=await t.count('messages',{conversationId:c._id,read:{$ne:true},sender:{$ne:u._id}});
     const chatPatch={id:c._id,summaryRevision:c.summaryRevision||0,unreadCount};
@@ -269,7 +281,7 @@ export class Service {
   async readMessages(p,cid,input){
     const {messageIds}=schemas.read.parse(input);
     return this.execute(p,true,async(t,u)=>{
-      await this.getChat(t,cid,u._id);await this.requireLocation(t,p);
+      await this.getChat(t,cid,u._id);
       // Acknowledge only messages actually displayed, never a timestamp that can
       // accidentally consume messages arriving concurrently or out of order.
       const result=await t.updateMany('messages',{conversationId:cid,_id:{$in:messageIds},sender:{$ne:u._id},read:{$ne:true}},{$set:{read:true}});
@@ -281,21 +293,21 @@ export class Service {
     if(!this.closeEnough(a,b)||await this.blocked(t,u._id,target))fail(403,'This person is unavailable.');
     if((a.category==='Dating')!==(b.category==='Dating'))fail(403,'Both people must choose Dating.');
     const pair=[u._id,target].sort();let c=await t.one('conversations',{a:pair[0],b:pair[1]});
-    if(!c){c={_id:id(),a:pair[0],b:pair[1],place_id:a.place_id,vibeA:false,vibeB:false,readyA:false,readyB:false,code:null,codeExpires:null};await t.insert('conversations',c);await this.emit(t,'chat.created',pair,{conversationId:c._id});}
+    if(!c){c={_id:id(),status:'active',a:pair[0],b:pair[1],place_id:a.place_id,vibeA:false,vibeB:false,readyA:false,readyB:false,code:null,codeExpires:null};await t.insert('conversations',c);await this.emit(t,'chat.created',pair,{conversationId:c._id});}
     return {id:c._id};
   });}
   async sendMessage(p,cid,input){const d=schemas.message.parse(input);return this.execute(p,true,async(t,u)=>{
-    const c=await this.getChat(t,cid,u._id);await this.requireLocation(t,p);const existing=await t.one('messages',{conversationId:cid,sender:u._id,clientId:d.clientId});
+    const c=await this.getChat(t,cid,u._id);const existing=await t.one('messages',{conversationId:cid,sender:u._id,clientId:d.clientId});
     if(existing){if(existing.body!==d.body)fail(409,'This message ID was already used for different text.');return {id:existing._id,clientId:d.clientId,created:existing.created};}
     if(await t.count('messages',{sender:u._id,created:{$gt:this.clock()-60}})>=20)fail(429,'You can send 20 messages a minute.');
-    const mid=id(),created=this.clock();await t.insert('messages',{_id:mid,conversationId:cid,sender:u._id,clientId:d.clientId,body:d.body,created});
-    await t.update('conversations',{_id:cid},{$inc:{summaryRevision:1}});
+    const mid=id(),created=this.clock(),seq=(c.messageSeq||0)+1;await t.insert('messages',{_id:mid,conversationId:cid,sender:u._id,clientId:d.clientId,body:d.body,created,seq});
+    await t.update('conversations',{_id:cid},{$inc:{summaryRevision:1},$set:{messageSeq:seq}});
     await enqueuePush(t,c,{_id:mid,sender:u._id},this.clock());
     await this.emit(t,'chat.message',[c.a,c.b],{conversationId:cid,messageId:mid});return {id:mid,clientId:d.clientId,created};
   }).then(result=>{pushLog('message_committed',{messageId:result.id,conversationId:cid,senderUserId:p.id});return result;});}
   async vibe(p,cid,input){const {value}=schemas.choice.parse(input);return this.execute(p,true,async(t,u)=>{
     const c=await this.getChat(t,cid,u._id),key=c.a===u._id?'vibeA':'vibeB',wasMutual=c.vibeA&&c.vibeB;
-    await this.requireLocation(t,p);if(c[key]===value)return {chat:await this.chatView(t,c,u._id)};c[key]=value;
+    if(c[key]===value)return {chat:await this.chatView(t,c,u._id)};c[key]=value;
     Object.assign(c,{readyA:false,readyB:false,code:null,codeExpires:null,revision:(c.revision||0)+1});
     if(!wasMutual&&c.vibeA&&c.vibeB)c.vibeTransition=id();
     await t.update('conversations',{_id:cid},{$set:{[key]:value,readyA:false,readyB:false,code:null,codeExpires:null,revision:c.revision,vibeTransition:c.vibeTransition||null}});
@@ -304,7 +316,7 @@ export class Service {
   });}
   async ready(p,cid,input){const {value}=schemas.choice.parse(input);return this.execute(p,true,async(t,u)=>{
     const c=await this.getChat(t,cid,u._id);if(!c.vibeA||!c.vibeB)fail(409,'Both people must connect first.');
-    await this.requireLocation(t,p);const before=!!c.code;
+    const before=!!c.code;
     if(!c.codeExpires||c.codeExpires<=this.clock()){c.readyA=false;c.readyB=false;c.code=null;c.codeExpires=this.clock()+600;}
     const key=c.a===u._id?'readyA':'readyB';
     if(c[key]===value)return {chat:await this.chatView(t,c,u._id)};
@@ -368,7 +380,7 @@ export class Service {
     const loc=await this.locationFor(t,p),here=await t.one('presence',{_id:u._id,...this.active()});
     const nearby=loc?await this.nearbyPeople(t,u._id,loc):[];
     const categories={};for(const person of nearby)categories[person.category]=(categories[person.category]||0)+1;
-    return {me:own(u),locationReady:!!loc,nearby:{count:nearby.length,categories},places:await this.placeList(t,p),circle:loc?await this.circleView(t,u._id):{presence:null,people:[]},chats:loc?await this.chatList(t,u._id):[],activities:loc?await this.activitiesView(t,u._id):[],blocks:await this.blocksView(t,u._id)};
+    return {me:own(u),locationReady:!!loc,nearby:{count:nearby.length,categories},places:await this.placeList(t,p),circle:loc?await this.circleView(t,u._id):{presence:null,people:[]},chats:await this.chatList(t,u._id),activities:loc?await this.activitiesView(t,u._id):[],blocks:await this.blocksView(t,u._id)};
   });}
-  async ban(uid){return transaction(this.client,this.db,true,async t=>{await t.update('users',{_id:uid},{$set:{banned:true}});await this.endPresence(t,[uid]);await t.remove('locations',{_id:uid});await t.remove('tokens',{userId:uid});await this.emit(t,'session.revoked',[uid]);});}
+  async ban(uid){return transaction(this.client,this.db,true,async t=>{await t.update('users',{_id:uid},{$set:{banned:true}});await this.endPresence(t,[uid]);const chats=await t.all('conversations',{$or:[{a:uid},{b:uid}]});await t.remove('messages',{conversationId:{$in:chats.map(c=>c._id)}});await t.remove('conversations',{_id:{$in:chats.map(c=>c._id)}});for(const c of chats)await this.emit(t,'chat.ended',[c.a,c.b],{conversationId:c._id});await t.remove('locations',{_id:uid});await t.remove('tokens',{userId:uid});await this.emit(t,'session.revoked',[uid]);});}
 }
