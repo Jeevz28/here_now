@@ -7,9 +7,10 @@ export async function connectDatabase(uri, name) {
   const hello=await client.db('admin').command({hello:1});
   if(!hello.setName && hello.msg!=='isdbgrid'){await client.close();throw new Error('HereNow needs a MongoDB replica set for transactions and live change streams. Use the included Docker Compose setup or MongoDB Atlas.');}
   const db=client.db(name);
-  for(const collection of ['users','tokens','places','presence','conversations','messages','activities','blocks','reports','events','control','locations','locationRisks','pushDevices','pushJobs']) {
+  for(const collection of ['users','tokens','places','presence','conversations','messages','activities','blocks','reports','events','control','locations','locationRisks','pushDevices','pushJobs','rateLimits']) {
     try{await db.createCollection(collection);}catch(e){if(e.code!==48)throw e;}
   }
+  await db.collection('rateLimits').createIndex({expiresAt:1},{expireAfterSeconds:0});
   await db.collection('pushDevices').createIndex({token:1},{unique:true});
   await db.collection('pushDevices').createIndex({userId:1});
   await db.collection('pushDevices').createIndex({expiresAt:1},{expireAfterSeconds:0});
@@ -23,7 +24,7 @@ export async function connectDatabase(uri, name) {
   await db.collection('places').createIndex({location:'2dsphere'});
   await db.collection('locations').createIndex({expiresAt:1},{expireAfterSeconds:0});
   await db.collection('locationRisks').createIndex({expiresAt:1},{expireAfterSeconds:0});
-  // Presence has no TTL index: application cleanup must also remove chats/memberships.
+  // Presence has no TTL index: application cleanup removes Live memberships, preserving chats.
   await db.collection('conversations').createIndex({a:1,b:1},{unique:true});
   await db.collection('conversations').createIndex({b:1});
   await db.collection('messages').createIndex({conversationId:1,sender:1,clientId:1},{unique:true});

@@ -1,9 +1,10 @@
+import {clientAddress} from './security.js';
 import {measured,metric} from './performance.js';
 import {WebSocketServer,WebSocket} from 'ws';
 import {z} from 'zod';
 import {Limiter,errorData,fail,identifier} from './core.js';
-const command=z.object({type:z.enum(['chat.send','chat.vibe','meetup.ready']),requestId:z.string().min(1).max(100),conversationId:identifier,payload:z.unknown()});
-export async function attachRealtime(server,service,{origins=[],authTimeoutMs=5000,pingIntervalMs=25000}={}){
+const command=z.object({type:z.enum(['chat.send','chat.vibe','meetup.ready']),requestId:z.string().min(1).max(100),conversationId:identifier,payload:z.unknown()}).strict();
+export async function attachRealtime(server,service,{origins=[],authTimeoutMs=5000,pingIntervalMs=25000,trust=()=>false}={}){
   const wss=new WebSocketServer({noServer:true,maxPayload:16*1024,perMessageDeflate:false});
   const connections=new Set(),limiter=new Limiter();
   let stopping=false;
@@ -18,7 +19,7 @@ export async function attachRealtime(server,service,{origins=[],authTimeoutMs=50
     // When WEB_ORIGINS is configured, enforce it for every origin-bearing
     // browser or native request.
     if(origins.length>0&&origin&&!origins.includes(origin)){socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');socket.destroy();return;}
-    const ip=req.socket.remoteAddress||'unknown';
+    const ip=clientAddress(req,trust);
     try{limiter.take('upgrade:'+ip,30);if(connections.size>=500||[...connections].filter(s=>s.clientIp===ip).length>=20)fail(429,'Connection limit reached.');}
     catch{socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');socket.destroy();return;}
     wss.handleUpgrade(req,socket,head,ws=>{ws.clientIp=ip;wss.emit('connection',ws,req);});
@@ -40,7 +41,7 @@ export async function attachRealtime(server,service,{origins=[],authTimeoutMs=50
           limiter.take('frames:'+ws.clientIp,240);
           try{msg=JSON.parse(raw.toString());}catch{fail(422,'Invalid JSON frame.');}
           if(!ws.principal){
-            const auth=z.object({type:z.literal('auth'),token:z.string().min(20).max(200)}).parse(msg);
+            const auth=z.object({type:z.literal('auth'),token:z.string().min(20).max(200)}).strict().parse(msg);
             const p=await service.authenticate(auth.token);
             if([...connections].filter(s=>s.principal?.id===p.id).length>=5)fail(429,'Too many sessions for this account.');
             if(ws.readyState!==WebSocket.OPEN)return;
@@ -49,7 +50,7 @@ export async function attachRealtime(server,service,{origins=[],authTimeoutMs=50
           // Revalidate revocation/expiry for every frame, including ping.
           ws.principal=await service.authenticateHash(ws.principal.hash);
           limiter.take('user:'+ws.principal.id,120);
-          if(msg.type==='ping'){send(ws,{type:'pong'});return;}
+          if(msg?.type==='ping'){z.object({type:z.literal('ping')}).strict().parse(msg);send(ws,{type:'pong'});return;}
           const d=command.parse(msg);let result;
           if(d.type==='chat.send')result=await measured('ws.chat.send',()=>service.sendMessage(ws.principal,d.conversationId,d.payload));
           if(d.type==='chat.vibe')result=await measured('ws.chat.vibe',()=>service.vibe(ws.principal,d.conversationId,d.payload));
@@ -74,7 +75,7 @@ export async function attachRealtime(server,service,{origins=[],authTimeoutMs=50
         try{
           if(['chat.created','chat.message','chat.changed','meetup.changed','chat.read'].includes(e.event))data=await service.chatEvent(ws.principal,e);
           else await service.authenticateHash(ws.principal.hash);
-        }catch(error){if(error.status===401){expire(ws);return;}if(![403,404].includes(error.status)){ws.close(1012,'Resynchronize state');return;}}
+        }catch(error){if(error.status===401){expire(ws);return;}if(![403,404].includes(error.status))ws.close(1012,'Resynchronize state');return;}
         if(e.event==='session.revoked'){expire(ws);return;}
         metric('ws.outboxToSend',Date.now()-new Date(e.createdAt).getTime());send(ws,{type:'event',event:e.event,id:e._id,...(e.conversationId?{conversationId:e.conversationId}:{}),...data});
       }));

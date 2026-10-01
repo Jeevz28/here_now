@@ -1,3 +1,4 @@
+import {proxyTrust} from './security.js';
 import {createFcmSender,startPushWorker} from './push.js';
 import {createServer} from 'node:http';
 import {connectDatabase} from './database.js';
@@ -6,11 +7,13 @@ import {createHttpApp} from './http.js';
 import {attachRealtime} from './realtime.js';
 export async function createApplication({mongoUri,dbName='herenow',demoMode=false,origins=[],rateLimits=true,clock,cleanupIntervalMs=5000,pushSender,pushIntervalMs=1000,...socketOptions}){
   const {client,db}=await connectDatabase(mongoUri,dbName);
-  const service=new Service(client,db,{demoMode,clock});
+  const service=new Service(client,db,{demoMode,clock,rateLimits});
   await service.cleanup();
-  const app=createHttpApp(service,{origins,rateLimits});const server=createServer(app);
+  const trust=proxyTrust();
+  const app=createHttpApp(service,{origins,rateLimits,trust});const server=createServer({maxHeaderSize:16384},app);
+  server.requestTimeout=30000;server.headersTimeout=15000;server.keepAliveTimeout=5000;
   let realtime;
-  try{realtime=await attachRealtime(server,service,{origins,...socketOptions});}catch(e){await client.close();throw e;}
+  try{realtime=await attachRealtime(server,service,{origins,trust,...socketOptions});}catch(e){await client.close();throw e;}
   const sender=pushSender===undefined?await createFcmSender():pushSender;service.pushConfigured=!!sender;
   const push=startPushWorker(service,sender,{intervalMs:pushIntervalMs});
   let sweeping=false;

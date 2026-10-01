@@ -4,16 +4,18 @@ import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import {Limiter,errorData,fail} from './core.js';
-export function createHttpApp(service,{origins=[],rateLimits=true}={}){
+export function createHttpApp(service,{origins=[],rateLimits=true,trust=()=>false}={}){
   const app=express(),limits=new Limiter();
+  app.set('trust proxy',trust);
   app.use(performanceMiddleware);app.disable('x-powered-by');app.use(helmet());
   app.use(cors({origin:(origin,cb)=>cb(null,!origin||origins.includes(origin)),methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Authorization','Content-Type'],exposedHeaders:['Server-Timing']}));
+  app.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');if(['POST','PATCH','DELETE'].includes(req.method)&&(Number(req.headers['content-length']||0)>0||req.headers['transfer-encoding'])&&!req.is('application/json'))return res.status(415).json({detail:'Use application/json.'});next();});
   app.use(express.json({limit:'16kb'}));
   app.use((req,res,next)=>{res.setHeader('Cache-Control','no-store');try{if(rateLimits)limits.take(req.ip+':'+(req.path.startsWith('/auth/')?'auth':'api'),req.path.startsWith('/auth/')?12:240);next();}catch(e){next(e);}});
   app.get('/health',async(req,res)=>{await service.db.command({ping:1});res.json({status:'ok',demoMode:service.demoMode,backend:'node',database:'mongodb',realtime:'websocket'});});
-  app.post('/auth/register',async(req,res)=>res.status(201).json(await service.register(req.body)));
-  app.post('/auth/login',async(req,res)=>res.json(await service.login(req.body)));
-  app.use(async(req,res,next)=>{const header=req.headers.authorization||'';if(!header.startsWith('Bearer '))fail(401,'Please sign in.');req.principal=await service.authenticate(header.slice(7));next();});
+  app.post('/auth/register',async(req,res)=>{await service.limits.take('auth-ip:'+req.ip,30,900000);res.status(201).json(await service.register(req.body));});
+  app.post('/auth/login',async(req,res)=>{await service.limits.take('auth-ip:'+req.ip,30,900000);res.json(await service.login(req.body));});
+  app.use(async(req,res,next)=>{const header=req.headers.authorization||'';if(!header.startsWith('Bearer '))fail(401,'Please sign in.');req.principal=await service.authenticate(header.slice(7));await service.limits.take('api:'+req.principal.id,300);next();});
   const route=(method,path,fn,status=200)=>app[method](path,async(req,res)=>res.status(status).json(await fn(req.principal,req)));
   route('get','/push/config',()=>({enabled:!!service.pushConfigured}));
   route('get','/push/status',p=>pushStatus(service,p));

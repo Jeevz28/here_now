@@ -2,3 +2,12 @@ node_modules
 .env
 test
 coverage
+
+.env.*
+!.env.example
+.test-data
+*.pem
+*.p12
+*.jks
+*service-account*.json
+*serviceAccount*.json

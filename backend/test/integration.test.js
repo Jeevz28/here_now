@@ -191,13 +191,13 @@ test('direct message events are private, authoritative and keep content out of t
  assert.ok(await runtime.service.chatEvent({id:b.id,hash:digest(b.token)},{event:'chat.message',conversationId:cid,messageId:incoming.message.id}));
 });
 
-const device=(u,installationId,preview=false,token='fcm-token-'+installationId+'-123456789')=>api('/push/devices',{token:u.token,method:'POST',body:{installationId,token,preview}});
+const device=(u,installationId,preview=false,token='fcm-token-'+installationId+'-123456789',stableChatIntent=false)=>api('/push/devices',{token:u.token,method:'POST',body:{installationId,token,preview,stableChatIntent}});
 test('durable push queues once per message/device; only recipient devices receive anonymous private payloads',async()=>{
- const {a,b,cid}=await pair();await device(a,'alice-phone');await device(b,'bob-phone');await device(b,'bob-tablet');
+ const {a,b,cid}=await pair();await device(a,'alice-phone');await device(b,'bob-phone');await device(b,'bob-tablet',false,undefined,true);
  const m=await send(a,cid,'Private hello','push-client-123');await send(a,cid,'Private hello','push-client-123');
  assert.equal(await runtime.db.collection('pushJobs').countDocuments({}),2);
  await Promise.all([runtime.push.drain(),runtime.push.drain()]);await runtime.push.drain();assert.equal(deliveries.length,2);
- for(const p of deliveries){assert.equal(p.data.messageId,m.id);assert.equal(p.data.recipientId,b.id);assert.equal(p.data.conversationId,cid);assert.equal(p.notification.body,'New message. Open herenow to read it.');assert.ok(!p.notification.title.includes('Alice'));assert.equal(p.android.notification.tag,m.id);assert.equal(p.android.notification.channelId,'messages');assert.ok(!('lat' in p.data));}
+ for(const p of deliveries){assert.equal(p.data.messageId,m.id);assert.equal(p.data.recipientId,b.id);assert.equal(p.data.conversationId,cid);assert.equal(p.notification.body,'New message. Open herenow to read it.');assert.ok(!p.notification.title.includes('Alice'));assert.equal(p.android.notification.tag,m.id);assert.equal(p.android.notification.channelId,'messages');assert.equal(p.android.notification.clickAction,p.token.includes('bob-tablet')?'com.herenow.social.OPEN_CHAT':undefined);assert.ok(!('lat' in p.data));}
 });
 test('push token rotation replaces old registration and preview opt-in controls message text',async()=>{
  const {a,b,cid}=await pair();await device(b,'bob-phone',false);await device(b,'bob-phone',true,'fresh-token-12345678901234567890');
@@ -264,7 +264,7 @@ test('30 minute discoverability expiry preserves HTTP/WS messaging, history, rea
  await runtime.db.collection('presence').updateMany({},{$set:{expires:runtime.service.clock()-1}});await runtime.service.cleanup();
  assert.equal((await api('/state',{token:b.token})).circle.presence,null);assert.equal((await api('/state',{token:b.token})).chats[0].id,cid);
  await runtime.db.collection('locations').deleteMany({});
- const sb=wsClient(b.token);await sb.ready;const ack=await sb.command('chat.send',cid,{body:'After timer','timer':'ignored',clientId:'timer-after-1'});assert.ok(ack.data.id);
+ const sb=wsClient(b.token);await sb.ready;const ack=await sb.command('chat.send',cid,{body:'After timer',clientId:'timer-after-1'});assert.ok(ack.data.id);
  const history=await api('/conversations/'+cid,{token:a.token});assert.equal(history.messages.length,2);
  await send(a,cid,'Push after expiry','timer-push-1');await runtime.push.drain();assert.ok(deliveries.some(d=>d.data.conversationId===cid));
 });
@@ -279,5 +279,105 @@ test('Live extension adds thirty minutes once and rejects stale session identifi
  const a=await user('Extension');await enter(a,{minutes:30});const before=await runtime.db.collection('presence').findOne({_id:a.id});
  const body={liveSessionId:before.liveSessionId,requestId:'extension-retry-1'};
  const first=await api('/presence/extend',{token:a.token,method:'POST',body});const retry=await api('/presence/extend',{token:a.token,method:'POST',body});assert.equal(first.expires,before.expires+1800);assert.equal(retry.expires,first.expires);
- await api('/presence/extend',{token:a.token,method:'POST',body:{...body,liveSessionId:'stale-session'},status:409});
+ await api('/presence/extend',{token:a.token,method:'POST',body:{...body,liveSessionId:'0'.repeat(32)},status:409});
+});
+test('modified client cannot spoof sender, peer vibe or ready, or mass-assign profile',async()=>{
+ const {a,b,cid}=await pair();
+ await api('/conversations/'+cid+'/messages',{token:a.token,method:'POST',body:{body:'Authenticated sender only',clientId:'security-sender-1',senderId:b.id,sender:b.id},status:422});
+ assert.equal(await runtime.db.collection('messages').countDocuments({conversationId:cid}),0);
+ await send(a,cid,'Authenticated sender only','security-sender-1');
+ assert.equal((await runtime.db.collection('messages').findOne({conversationId:cid})).sender,a.id);
+ await api('/me',{token:a.token,method:'PATCH',body:{name:'Alice',interests:'Music',userId:b.id,role:'admin',banned:false,verified:true},status:422});
+ const saved=await runtime.db.collection('users').findOne({_id:a.id});assert.equal(saved.role,undefined);assert.equal(saved.verified,undefined);assert.equal((await api('/me',{token:b.token})).name,'Bob');
+ await api('/conversations/'+cid+'/vibe',{token:a.token,method:'POST',body:{value:true,userId:b.id,mutual:true,vibeA:true,vibeB:true},status:422});
+ assert.equal((await api('/conversations/'+cid,{token:b.token})).liked,false);
+ await api('/conversations/'+cid+'/ready',{token:a.token,method:'POST',body:{value:true,userId:b.id,readyA:true,readyB:true},status:422});
+ await choice(a,cid,'ready',true,409);
+ const eve=await user('Eve');for(const action of ['vibe','ready'])await choice(eve,cid,action,true,404);
+});
+test('operator injection and outsider history/notification target IDs do not grant access',async()=>{
+ const {a,cid}=await pair(),eve=await user('Eve');
+ await api('/auth/login',{method:'POST',body:{email:{$ne:null},password:{$ne:null}},status:422});
+ await api('/conversations',{token:a.token,method:'POST',body:{target:{$ne:a.id}},status:422});
+ for(const path of ['', '/summary','/messages','/sync?after=0'])await api('/conversations/'+cid+path,{token:eve.token,status:404});
+ await api('/conversations/'+cid+'/read',{token:eve.token,method:'POST',body:{messageIds:['0'.repeat(32)]},status:404});
+ await api('/conversations/'+cid,{status:401});
+});
+
+test('security: foreign installation and FCM token cannot overwrite recipient registration',async()=>{
+ const {a,b}=await pair();await device(b,'victim-installation',false,'victim-fcm-token-123456789');
+ await api('/push/devices',{token:a.token,method:'POST',body:{installationId:'victim-installation',token:'attacker-fcm-token-123456789'},status:409});
+ await api('/push/devices',{token:a.token,method:'POST',body:{installationId:'attacker-installation',token:'victim-fcm-token-123456789'},status:409});
+ assert.equal((await runtime.db.collection('pushDevices').findOne({installationId:'victim-installation'})).userId,b.id);
+ await api('/auth/logout',{token:b.token,method:'POST'});await device(a,'victim-installation',false,'victim-fcm-token-123456789');
+ assert.equal((await runtime.db.collection('pushDevices').findOne({installationId:'victim-installation'})).userId,a.id);
+});
+test('security: malformed cursors and Live selector operators are rejected without changing state',async()=>{
+ const {a,cid}=await pair();const here=await runtime.db.collection('presence').findOne({_id:a.id});
+ await api('/conversations/'+cid+'/messages?before='+Buffer.from('null').toString('base64url'),{token:a.token,status:422});
+ await api('/conversations/'+cid+'/messages?beforeId=a&beforeId=b',{token:a.token,status:422});
+ await api('/location',{token:a.token,method:'DELETE',body:{liveSessionId:{$ne:null}},status:422});
+ await fix(a,55.8685,-4.284,{liveSessionId:{$ne:null}},422);
+ assert.equal((await runtime.db.collection('presence').findOne({_id:a.id})).liveSessionId,here.liveSessionId);
+ await api('/presence',{token:a.token,method:'POST',body:{placeId:null,category:'Friends',expiresAt:9999999999999},status:422});
+});
+test('security: report abuse and choice spam limits share state across transports and instances',async()=>{
+ const {a,b,cid}=await pair();runtime.service.limits.enabled=true;
+ const s=wsClient(a.token);await s.ready;
+ for(let i=0;i<20;i++){if(i%2)await choice(a,cid,'vibe',!!(i%3));else await s.command('chat.vibe',cid,{value:!!(i%3)});}
+ assert.equal((await s.command('chat.vibe',cid,{value:true},'error')).status,429);
+ await choice(a,cid,'vibe',true,429);
+ // Last accepted Vibe was true; establish mutual consent before readiness spam.
+ await choice(b,cid,'vibe',true);
+ for(let i=0;i<20;i++){if(i%2)await choice(a,cid,'ready',!!(i%3));else await s.command('meetup.ready',cid,{value:!!(i%3)});}
+ assert.equal((await s.command('meetup.ready',cid,{value:true},'error')).status,429);
+ await choice(a,cid,'ready',true,429);
+ for(let i=0;i<5;i++)await api('/reports',{token:a.token,method:'POST',body:{target:b.id,reason:'Report abuse test'},status:201});
+ await api('/reports',{token:a.token,method:'POST',body:{target:b.id,reason:'Another report'},status:429});
+ const {SharedLimiter}=await import('../src/security.js');const another=new SharedLimiter(runtime.db);
+ await assert.rejects(another.take('report:'+a.id,5,3600000),e=>e.status===429);
+ assert.equal(await runtime.db.collection('reports').countDocuments({reporter:a.id}),5);
+});
+test('security: login account budget cannot reset with a new limiter or changed source IP',async()=>{
+ const a=await user('Budget');runtime.service.limits.enabled=true;
+ // Consume the shared account budget without spending CPU on 20 password hashes.
+ for(let i=0;i<20;i++)await runtime.service.limits.take('login:budget@example.com',20,900000);
+ await api('/auth/login',{method:'POST',body:{email:'BUDGET@example.com',password:'Testing12345!'},status:429});
+ const {SharedLimiter}=await import('../src/security.js');runtime.service.limits=new SharedLimiter(runtime.db);
+ await api('/auth/login',{method:'POST',body:{email:'budget@example.com',password:'wrongpassword'},status:429});
+ assert.equal((await api('/me',{token:a.token})).id,a.id);
+});
+test('security: forbidden WS event is suppressed after authorization fails',async()=>{
+ const {a,cid}=await pair(),eve=await user('EventOutsider'),s=wsClient(eve.token);await s.ready;
+ await runtime.db.collection('events').insertOne({_id:'f'.repeat(32),scope:'users',users:[eve.id],event:'chat.message',conversationId:cid,createdAt:new Date(),expiresAt:new Date(Date.now()+60000)});
+ await assert.rejects(s.next(d=>d.event==='chat.message'&&d.conversationId===cid,250),/Timed out/);
+ s.ws.send(JSON.stringify({type:'join',conversationId:cid,requestId:'illegal-join'}));assert.equal((await s.next(d=>d.requestId==='illegal-join')).status,422);
+});
+test('security: unsupported content type and oversized HTTP requests rejected safely',async()=>{
+ const a=await user('Payload');
+ const type=await fetch(base+'/me',{method:'PATCH',headers:{Authorization:'Bearer '+a.token,'Content-Type':'text/plain'},body:'hello'});assert.equal(type.status,415);
+ const big=await fetch(base+'/me',{method:'PATCH',headers:{Authorization:'Bearer '+a.token,'Content-Type':'application/json'},body:JSON.stringify({name:'a'.repeat(20000),interests:''})});assert.equal(big.status,413);assert.equal(big.headers.get('cache-control'),'no-store');assert.ok(!(await big.text()).includes('stack'));
+});
+test('security: legacy password hashes upgrade only after valid password',async()=>{
+ const a=await user('Legacy');const {scryptSync}=await import('node:crypto');const salt='01'.repeat(16);const legacy=salt+':'+scryptSync('Testing12345!',Buffer.from(salt,'hex'),64,{N:16384,r:8,p:1}).toString('hex');
+ await runtime.db.collection('users').updateOne({_id:a.id},{$set:{password:legacy}});
+ await api('/auth/login',{method:'POST',body:{email:'legacy@example.com',password:'Wrong12345!'},status:401});assert.equal((await runtime.db.collection('users').findOne({_id:a.id})).password,legacy);
+ await api('/auth/login',{method:'POST',body:{email:'legacy@example.com',password:'Testing12345!'}});assert.ok((await runtime.db.collection('users').findOne({_id:a.id})).password.startsWith('scrypt$131072$8$1$'));
+});
+
+test('security: concurrent quota claims across instances remain atomic and private',async()=>{
+ const {SharedLimiter}=await import('../src/security.js');const a=new SharedLimiter(runtime.db),b=new SharedLimiter(runtime.db);
+ const results=await Promise.allSettled(Array.from({length:24},(_,i)=>(i%2?a:b).take('test-private-account@example.com',10,86400000)));
+ assert.equal(results.filter(x=>x.status==='fulfilled').length,10);assert.ok(results.filter(x=>x.status==='rejected').every(x=>x.reason.status===429));
+ const rows=await runtime.db.collection('rateLimits').find({}).toArray();assert.ok(!JSON.stringify(rows).includes('test-private-account'));assert.equal(rows[0].count,24);
+});
+test('security: malformed and oversized WS frames cannot invoke commands',async()=>{
+ const a=await user('Frame');const s=wsClient(a.token);await s.ready;
+ s.ws.send('null');assert.equal((await s.next(d=>d.type==='error')).status,422);
+ s.ws.send(JSON.stringify({type:'ping',senderId:'spoof'}));assert.equal((await s.next(d=>d.type==='error')).status,422);
+ const closed=new Promise(resolve=>s.ws.once('close',resolve));s.ws.send('x'.repeat(17*1024));assert.equal(await closed,1009);
+});
+test('security: protected routes deny absent authentication before data access',async()=>{
+ const cid='0'.repeat(32);
+ for(const [method,path] of [['GET','/me'],['PATCH','/me'],['DELETE','/me'],['GET','/state'],['GET','/circle'],['GET','/places'],['POST','/location'],['POST','/presence'],['DELETE','/presence'],['GET','/conversations'],['POST','/conversations'],['GET','/conversations/'+cid],['POST','/conversations/'+cid+'/messages'],['POST','/conversations/'+cid+'/vibe'],['POST','/conversations/'+cid+'/ready'],['POST','/blocks'],['POST','/reports'],['POST','/push/devices'],['GET','/push/status']])await api(path,{method,status:401});
 });

@@ -1,16 +1,18 @@
 import {z} from 'zod';
-import {digest,id} from './core.js';
+import {digest,id,fail} from './core.js';
 // Structured stages contain IDs/codes only: never credentials, tokens or message text.
 export function pushLog(stage,fields={}){console.info(JSON.stringify({component:'herenow.push',stage,...fields}));}
 
-const registration=z.object({installationId:z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/),token:z.string().min(20).max(4096),preview:z.boolean().default(false)});
+const registration=z.object({installationId:z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/),token:z.string().min(20).max(4096),preview:z.boolean().default(false),stableChatIntent:z.boolean().default(false)}).strict();
 export async function registerPush(service,p,input){
  const data=registration.parse(input);
  const result=await service.execute(p,true,async(t,u)=>{
+  const conflicts=await t.all('pushDevices',{$or:[{installationId:data.installationId},{token:data.token}]});
+  for(const old of conflicts)if(old.userId!==u._id&&old.expiresAt>new Date()&&await t.one('tokens',{_id:old.tokenHash,expiresAt:{$gt:new Date()}}))fail(409,'This device is registered to another signed-in account. Sign out there first.');
   // A refreshed FCM token or account switch replaces the old installation binding.
   await t.remove('pushDevices',{$or:[{installationId:data.installationId},{token:data.token}]});
   const auth=await t.one('tokens',{_id:p.hash});
-  await t.insert('pushDevices',{_id:digest(data.installationId),installationId:data.installationId,userId:u._id,tokenHash:p.hash,token:data.token,preview:data.preview,expiresAt:auth.expiresAt});
+  await t.insert('pushDevices',{_id:digest(data.installationId),installationId:data.installationId,userId:u._id,tokenHash:p.hash,token:data.token,preview:data.preview,stableChatIntent:data.stableChatIntent,expiresAt:auth.expiresAt});
   return {ok:true};
  });
  pushLog('device_registered',{recipientUserId:p.id,deviceId:digest(data.installationId)});return result;
@@ -32,7 +34,7 @@ export async function createFcmSender(){
  if(process.env.PUSH_ENABLED!=='true'){pushLog('disabled',{reason:'PUSH_ENABLED is not true'});return null;}
  const {initializeApp,cert,applicationDefault,getApps}=await import('firebase-admin/app');
  const {getMessaging}=await import('firebase-admin/messaging');
- const credential=process.env.FIREBASE_SERVICE_ACCOUNT_JSON?cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)):applicationDefault();
+ let credential;try{credential=process.env.FIREBASE_SERVICE_ACCOUNT_JSON?cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON)):applicationDefault();}catch{throw new Error('Invalid backend Firebase credentials');}
  const app=getApps().find(a=>a.name==='herenow-push')||initializeApp({credential},'herenow-push');
  pushLog('configured',{projectId:app.options.projectId||app.options.credential?.projectId||process.env.GOOGLE_CLOUD_PROJECT||'application-default'});
  return payload=>getMessaging(app).send(payload);
@@ -50,7 +52,7 @@ export function startPushWorker(service,send,{intervalMs=1000}={}){
    const m=await t.one('messages',{_id:job.messageId,conversationId:c._id,read:{$ne:true}});
    if(!m||m.sender===u._id)return null;
    const sender=await t.one('users',{_id:m.sender});if(!sender)return null;
-   return {token:device.token,notification:{title:sender.alias+' · herenow',body:device.preview?(Array.from(m.body).slice(0,160).join('')+(Array.from(m.body).length>160?'…':'')):'New message. Open herenow to read it.'},data:{type:'chat.message',conversationId:c._id,messageId:m._id,senderId:m.sender,recipientId:u._id},android:{priority:'high',ttl:Math.max(0,job.expiresAt.getTime()-Date.now()),collapseKey:c._id,notification:{channelId:'messages',icon:'herenow_notification',color:'#6D28D9',tag:m._id,eventTimestamp:new Date(m.created*1000),visibility:'private',sound:'default'}}};
+   return {token:device.token,notification:{title:sender.alias+' · herenow',body:device.preview?(Array.from(m.body).slice(0,160).join('')+(Array.from(m.body).length>160?'…':'')):'New message. Open herenow to read it.'},data:{type:'chat.message',conversationId:c._id,messageId:m._id,senderId:m.sender,recipientId:u._id},android:{priority:'high',ttl:Math.max(0,job.expiresAt.getTime()-Date.now()),collapseKey:c._id,notification:{...(device.stableChatIntent?{clickAction:'com.herenow.social.OPEN_CHAT'}:{}),channelId:'messages',icon:'herenow_notification',color:'#6D28D9',tag:m._id,eventTimestamp:new Date(m.created*1000),visibility:'private',sound:'default'}}};
   });}catch(e){if([401,403,404,409].includes(e.status)){pushLog('skipped',{...fields,reason:'session_or_conversation_ineligible'});return {outcome:'skipped',reason:'session_or_conversation_ineligible'};}throw e;}
   if(!payload){pushLog('skipped',{...fields,reason:'message_read_or_unavailable'});return {outcome:'skipped',reason:'message_read_or_unavailable'};}
   try{pushLog('fcm_attempt',fields);const providerMessageId=await send(payload);pushLog('fcm_accepted',{...fields,providerMessageId});return {outcome:'accepted',providerMessageId,acceptedAt:new Date()};}catch(e){e.deviceToken=device.token;throw e;}
