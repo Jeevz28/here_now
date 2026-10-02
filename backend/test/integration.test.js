@@ -8,7 +8,10 @@ import {LOCATION_LEASE_SECONDS} from '../src/service.js';
 import {createApplication} from '../src/app.js';
 let mongo,runtime,base,folder,sequence=0;const sockets=[];let deliveries=[],pushFailure=null;
 before(async()=>{await mkdir('.test-data',{recursive:true});folder=await mkdtemp(process.cwd()+'/.test-data/mongo-');mongo=await MongoMemoryReplSet.create({instanceOpts:[{dbPath:folder}],replSet:{count:1,args:['--nounixsocket','--setParameter','diagnosticDataCollectionEnabled=false']},binary:{version:'7.0.14'}});});
-beforeEach(async()=>{deliveries=[];pushFailure=null;runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+(++sequence),demoMode:true,origins:['http://10.0.2.2:8000'],rateLimits:false,authTimeoutMs:300,pushIntervalMs:3600000,pushSender:async payload=>{if(pushFailure)throw pushFailure;deliveries.push(payload);return 'fcm-test-id';}});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;});
+beforeEach(async()=>{deliveries=[];pushFailure=null;runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+(++sequence),demoMode:true,origins:['http://10.0.2.2:8000'],rateLimits:false,authTimeoutMs:300,pushIntervalMs:3600000,pushSender:async payload=>{if(pushFailure)throw pushFailure;deliveries.push(payload);return 'fcm-test-id';}});await runtime.db.collection('places').insertMany([
+ {_id:'kelvingrove',name:'Kelvingrove Park',lat:55.8685,lon:-4.284,radius:700,landmark:'Park entrance',location:{type:'Point',coordinates:[-4.284,55.8685]}},
+ {_id:'george-square',name:'George Square',lat:55.8612,lon:-4.2502,radius:350,location:{type:'Point',coordinates:[-4.2502,55.8612]}}
+ ]);await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;});
 afterEach(async()=>{for(const ws of sockets.splice(0))ws.terminate();await runtime.close();});
 after(async()=>{await mongo?.stop();if(folder)await rm(folder,{recursive:true,force:true});});
 async function api(path,{token,method='GET',body,status=200}={}){const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},...(body!==undefined?{body:JSON.stringify(body)}:{})});const data=await r.json();assert.equal(r.status,status,JSON.stringify(data));return data;}
@@ -58,9 +61,9 @@ test('presence departure preserves chat and message history while removing disco
 test('stale presence expires without ending established conversation',async()=>{const {a,b,cid}=await pair();await runtime.db.collection('presence').updateOne({_id:b.id},{$set:{checked:runtime.service.clock()-LOCATION_LEASE_SECONDS-1}});await runtime.service.cleanup();assert.deepEqual((await api('/circle',{token:a.token})).people,[]);await api('/conversations/'+cid,{token:b.token});});
 test('heartbeats cannot extend the original session deadline',async()=>{const a=await user('Alice');await enter(a,{minutes:30});const original=await runtime.db.collection('presence').findOne({_id:a.id});await api('/presence/heartbeat',{token:a.token,method:'POST',body:live});assert.equal((await runtime.db.collection('presence').findOne({_id:a.id})).expires,original.expires);await runtime.db.collection('presence').updateOne({_id:a.id},{$set:{expires:runtime.service.clock()-1}});await api('/presence/heartbeat',{token:a.token,method:'POST',body:live,status:409});assert.equal((await api('/circle',{token:a.token})).presence,null);});
 test('meetup expiry pushes updates and requires fresh mutual consent',async()=>{const {a,b,cid}=await pair();for(const u of [a,b])await choice(u,cid,'vibe');for(const u of [a,b])await choice(u,cid,'ready');const sa=wsClient(a.token);await sa.ready;await runtime.db.collection('conversations').updateOne({_id:cid},{$set:{codeExpires:runtime.service.clock()-1}});await runtime.service.cleanup();await sa.next(event(cid,'meetup.changed'));const v=await api('/conversations/'+cid,{token:a.token});assert.equal(v.ready,false);assert.equal(v.meetup,null);await choice(a,cid,'ready');assert.equal((await api('/conversations/'+cid,{token:a.token})).meetup,null);});
-test('transactional joins cannot overfill the last activity slot',async()=>{const {a,b}=await pair(),c=await user('Charlie');await enter(c);const {id}=await api('/activities',{token:a.token,method:'POST',body:{title:'Two-player game',capacity:2},status:201});const results=await Promise.all([b,c].map(u=>fetch(base+'/activities/'+id+'/join',{method:'POST',headers:{Authorization:'Bearer '+u.token}})));assert.deepEqual(results.map(r=>r.status).sort(),[200,409]);assert.equal((await api('/activities',{token:a.token}))[0].count,2);});
-test('activities update live and close on owner departure',async()=>{const {a,b}=await pair(),sa=wsClient(a.token);await sa.ready;const {id}=await api('/activities',{token:a.token,method:'POST',body:{title:'Coffee in the park',capacity:5,category:'Friends'},status:201});await api(`/activities/${id}/join`,{token:b.token,method:'POST'});await sa.next(d=>d.event==='circle.changed');assert.equal((await api('/activities',{token:a.token}))[0].count,2);await api(`/activities/${id}/membership`,{token:b.token,method:'DELETE'});assert.equal((await api('/activities',{token:a.token}))[0].count,1);await api('/presence',{token:a.token,method:'DELETE'});assert.deepEqual(await api('/activities',{token:b.token}),[]);});
-test('blocking enforces live chat closure and group isolation',async()=>{const {a,b,cid}=await pair(),sb=wsClient(b.token);await sb.ready;const act=await api('/activities',{token:a.token,method:'POST',body:{title:'Football game',capacity:5},status:201});await api('/blocks',{token:a.token,method:'POST',body:{target:b.id}});await sb.next(event(cid,'chat.ended'));assert.equal((await sb.command('chat.send',cid,{body:'Blocked send',clientId:'blocked-001'},'error')).status,404);await api('/activities/'+act.id+'/join',{token:b.token,method:'POST',status:404});assert.deepEqual((await api('/circle',{token:b.token})).people,[]);await api('/blocks/'+b.id,{token:a.token,method:'DELETE'});assert.equal((await api('/circle',{token:b.token})).people.length,1);});
+test('transactional joins cannot overfill the last activity slot',async()=>{const {a,b}=await pair(),c=await user('Charlie');await enter(c);const {id}=await api('/activities',{token:a.token,method:'POST',body:{title:'Two-player game',maxParticipants:2,category:'Sports',minutes:60,clientId:'activity-create-1'},status:201});const results=await Promise.all([b,c].map(u=>fetch(base+'/activities/'+id+'/join',{method:'POST',headers:{Authorization:'Bearer '+u.token}})));assert.deepEqual(results.map(r=>r.status).sort(),[200,409]);assert.equal((await api('/activities',{token:a.token}))[0].participantCount,2);});
+test('activities update live and close on owner departure',async()=>{const {a,b}=await pair(),sa=wsClient(a.token);await sa.ready;const {id}=await api('/activities',{token:a.token,method:'POST',body:{title:'Coffee in the park',maxParticipants:5,category:'Coffee',minutes:60,clientId:'activity-create-1'},status:201});await api(`/activities/${id}/join`,{token:b.token,method:'POST'});await sa.next(d=>d.event==='activities.changed');assert.equal((await api('/activities',{token:a.token}))[0].participantCount,2);await api(`/activities/${id}/membership`,{token:b.token,method:'DELETE'});assert.equal((await api('/activities',{token:a.token}))[0].participantCount,1);await api('/presence',{token:a.token,method:'DELETE'});assert.deepEqual(await api('/activities',{token:b.token}),[]);});
+test('blocking enforces live chat closure and group isolation',async()=>{const {a,b,cid}=await pair(),sb=wsClient(b.token);await sb.ready;const act=await api('/activities',{token:a.token,method:'POST',body:{title:'Football game',maxParticipants:5,category:'Sports',minutes:60,clientId:'activity-create-1'},status:201});await api('/blocks',{token:a.token,method:'POST',body:{target:b.id}});await sb.next(event(cid,'chat.ended'));assert.equal((await sb.command('chat.send',cid,{body:'Blocked send',clientId:'blocked-001'},'error')).status,404);await api('/activities/'+act.id+'/join',{token:b.token,method:'POST',status:404});assert.deepEqual((await api('/circle',{token:b.token})).people,[]);await api('/blocks/'+b.id,{token:a.token,method:'DELETE'});assert.equal((await api('/circle',{token:b.token})).people.length,1);});
 test('reported evidence survives session end then expires',async()=>{const {a,b,cid}=await pair();await send(b,cid,'Evidence sample','report-msg-1');const r=await api('/reports',{token:a.token,method:'POST',body:{target:b.id,reason:'Unwanted contact'},status:201});await api('/presence',{token:a.token,method:'DELETE'});assert.equal((await runtime.db.collection('reports').findOne({_id:r.id})).evidence[0].body,'Evidence sample');await runtime.db.collection('reports').updateOne({_id:r.id},{$set:{expiresAt:new Date(0)}});await runtime.service.cleanup();assert.equal(await runtime.db.collection('reports').countDocuments(),0);});
 test('logout immediately revokes WebSocket and HTTP access',async()=>{const a=await user('Alice'),sa=wsClient(a.token);await sa.ready;await api('/auth/logout',{token:a.token,method:'POST'});await sa.next(d=>d.type==='auth.expired');await api('/me',{token:a.token,status:401});});
 test('account deletion cascades and operator bans revoke sockets',async()=>{const {a,b,cid}=await pair(),sb=wsClient(b.token);await sb.ready;await api('/me',{token:a.token,method:'DELETE'});await sb.next(event(cid,'chat.ended'));assert.equal(await runtime.db.collection('users').findOne({_id:a.id}),null);await runtime.service.ban(b.id);await sb.next(d=>d.type==='auth.expired');await api('/me',{token:b.token,status:401});});
@@ -75,14 +78,14 @@ test('chat rate limits apply across both transports',async()=>{const {a,cid}=awa
 test('1 km boundary works without a venue and hides all coordinate fields',async()=>{
  const a=await user('Alpha'),b=await user('Beta'),c=await user('Charlie');
  for(const [u,lat] of [[a,0],[b,0.0089],[c,0.0091]]){await fix(u,lat,0);await api('/presence',{token:u.token,method:'POST',body:{category:'Pets'}});}
- const state=await api('/state',{token:a.token});assert.equal(state.nearby.count,1);assert.equal(state.nearby.categories.Pets,1);assert.deepEqual(state.circle.people.map(x=>x.id),[b.id]);assert.equal(state.places.length,0);
+ const state=await api('/state',{token:a.token});assert.equal(state.nearby.count,1);assert.equal(state.nearby.categories.Pets,1);assert.deepEqual(state.circle.people.map(x=>x.id),[b.id]);assert.equal('places' in state,false);
  const json=JSON.stringify(state);for(const k of ['coordinates','accuracy','timestamp','tokenHash','distance'])assert.ok(!json.includes('"'+k+'"'));
  await api('/conversations',{token:a.token,method:'POST',body:{target:b.id},status:201});await api('/conversations',{token:a.token,method:'POST',body:{target:c.id},status:403});
 });
-test('curated venue discovery excludes a place at 1.4 km',async()=>{
+test('removed Places endpoint is unavailable; legacy place entry still checks radius',async()=>{
  const a=await user('Alpha');await fix(a,0,0);
  for(const [key,lat] of [['inside',0.008],['outside',0.0126]])await runtime.db.collection('places').insertOne({_id:key,name:key,lat,lon:0,radius:100,location:{type:'Point',coordinates:[0,lat]}});
- const places=await api('/places',{token:a.token});assert.deepEqual(places.map(x=>x.id),['inside']);
+ await api('/places',{token:a.token,status:404});
  await api('/presence',{token:a.token,method:'POST',body:{placeId:'inside',category:'Friends'},status:403});
 });
 test('mock, inaccurate and stale fixes revoke live presence; profile stays accessible',async()=>{
@@ -149,7 +152,7 @@ test('message pages use stable cursors without overlap',async()=>{
 
 test('leaving Live preserves verified discovery location and normal expiry is not a location failure',async()=>{
  const a=await user('Alice');await enter(a);await api('/presence',{token:a.token,method:'DELETE'});
- const state=await api('/state',{token:a.token});assert.equal(state.locationReady,true);assert.equal(state.circle.presence,null);assert.ok(state.places.length>0);
+ const state=await api('/state',{token:a.token});assert.equal(state.locationReady,true);assert.equal(state.circle.presence,null);assert.ok(Array.isArray(state.activities));
  await api('/presence',{token:a.token,method:'POST',body:{category:'Friends',minutes:30}});
  await runtime.db.collection('presence').updateOne({_id:a.id},{$set:{expires:runtime.service.clock()-1}});await runtime.service.cleanup();
  const expired=await api('/state',{token:a.token});assert.equal(expired.locationReady,true);assert.equal(expired.circle.presence,null);
@@ -173,11 +176,11 @@ test('gender registration is stored and anonymous discovery reveals only allowed
  await api('/auth/register',{method:'POST',body:{name:'Bad',email:'badgender@example.com',dob:'1997-01-01',password:'Testing12345!',gender:'unknown'},status:422});
 });
 
-test('nearby place activity counts include only active eligible owners',async()=>{
- const {a,b}=await pair();await api('/activities',{token:a.token,method:'POST',body:{title:'Coffee together',category:'Friends',capacity:6},status:201});
- assert.equal((await api('/places',{token:b.token})).find(p=>p.id==='kelvingrove').activityCount,1);
+test('activities hide blocked owners',async()=>{
+ const {a,b}=await pair();await api('/activities',{token:a.token,method:'POST',body:{title:'Coffee together',category:'Coffee',maxParticipants:6,minutes:60,clientId:'activity-create-1'},status:201});
+ assert.equal((await api('/activities',{token:b.token})).length,1);
  await api('/blocks',{token:b.token,method:'POST',body:{target:a.id}});
- assert.equal((await api('/places',{token:b.token})).find(p=>p.id==='kelvingrove').activityCount,0);
+ assert.equal((await api('/activities',{token:b.token})).length,0);
 });
 
 test('direct message events are private, authoritative and keep content out of the outbox',async()=>{
@@ -380,4 +383,110 @@ test('security: malformed and oversized WS frames cannot invoke commands',async(
 test('security: protected routes deny absent authentication before data access',async()=>{
  const cid='0'.repeat(32);
  for(const [method,path] of [['GET','/me'],['PATCH','/me'],['DELETE','/me'],['GET','/state'],['GET','/circle'],['GET','/places'],['POST','/location'],['POST','/presence'],['DELETE','/presence'],['GET','/conversations'],['POST','/conversations'],['GET','/conversations/'+cid],['POST','/conversations/'+cid+'/messages'],['POST','/conversations/'+cid+'/vibe'],['POST','/conversations/'+cid+'/ready'],['POST','/blocks'],['POST','/reports'],['POST','/push/devices'],['GET','/push/status']])await api(path,{method,status:401});
+});
+
+const activityInput=(extra={})=>({title:'A nearby game',description:'Bring your enthusiasm',category:'Sports',maxParticipants:8,minutes:60,clientId:'activity-'+Math.random().toString(36).slice(2),...extra});
+test('activities: global 1 km boundary, private DTOs, no venue requirement, valid-location browsing',async()=>{
+ const a=await user('Host'),b=await user('Near'),c=await user('Far');
+ for(const [u,lat] of [[a,0],[b,.0089],[c,.0091]]){await fix(u,lat,0);await api('/presence',{token:u.token,method:'POST',body:{category:'Friends'}});}
+ const d=activityInput();const act=await api('/activities',{token:a.token,method:'POST',body:d,status:201});
+ assert.equal(act.participantCount,1);assert.equal(act.isOwner,true);
+ assert.equal((await api('/activities',{token:b.token}))[0].id,act.id);
+ assert.deepEqual(await api('/activities',{token:c.token}),[]);
+ await api('/activities/'+act.id+'/join',{token:c.token,method:'POST',status:404});
+ for(const route of ['/state','/activities','/activities/'+act.id]){
+  const value=await api(route,{token:b.token}),json=JSON.stringify(value);
+  for(const key of ['coordinates','location','distance','accuracy','tokenHash','email','dob'])assert.ok(!JSON.stringify(route==='/state'?value.activities:value).includes('"'+key+'"'),key);
+ }
+ const again=await api('/activities',{token:a.token,method:'POST',body:d,status:201});assert.equal(again.id,act.id);
+ await api('/presence',{token:b.token,method:'DELETE'});assert.equal((await api('/activities',{token:b.token})).length,1);
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST',status:409});
+});
+test('activities: ten simultaneous applicants cannot take more than seven remaining seats, duplicates idempotent',async()=>{
+ const a=await user('Host');await enter(a,{placeId:null});const act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ const applicants=[];for(let i=0;i<10;i++){const u=await user('Guest'+i);await enter(u,{placeId:null});applicants.push(u);}
+ const results=await Promise.all(applicants.map(async u=>({u,r:await fetch(base+'/activities/'+act.id+'/join',{method:'POST',headers:{Authorization:'Bearer '+u.token}})})));
+ assert.equal(results.filter(x=>x.r.status===200).length,7);assert.equal(results.filter(x=>x.r.status===409).length,3);
+ const stored=await runtime.db.collection('activities').findOne({_id:act.id});assert.equal(stored.participantCount,8);assert.equal(new Set(stored.participantIds).size,8);assert.equal(stored.status,'full');
+ const member=results.find(x=>x.r.status===200).u;
+ await Promise.all([1,2].map(()=>api('/activities/'+act.id+'/join',{token:member.token,method:'POST'})));
+ assert.equal((await api('/activities/'+act.id,{token:a.token})).participantCount,8);
+ await api('/activities/'+act.id+'/membership',{token:member.token,method:'DELETE'});
+ assert.equal((await api('/activities/'+act.id,{token:a.token})).participantCount,7);
+ assert.equal((await api('/activities/'+act.id,{token:a.token})).status,'active');
+ await api('/activities/'+act.id,{token:member.token,method:'DELETE',status:404});
+});
+test('activities: private group messages deduplicate, sync missed events and enforce membership/block/end',async()=>{
+ const {a,b,cid}=await pair(),c=await user('Outsider');await enter(c);
+ const act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ await api('/activities/'+act.id+'/messages',{token:b.token,status:403});
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST'});
+ const ws=wsClient(b.token);await ws.ready;
+ const message={body:'Hello team',clientId:'group-message-001'};
+ const first=await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:message,status:201});
+ const evt=await ws.next(e=>e.event==='activity.message'&&e.activityId===act.id);assert.ok(!('body' in evt));assert.ok(!('location' in evt));
+ const retry=await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:message,status:201});assert.equal(first.id,retry.id);
+ const history=await api('/activities/'+act.id+'/messages?after=0',{token:b.token});assert.equal(history.messages.length,1);assert.equal(history.messages[0].body,'Hello team');
+ assert.equal((await api('/activities/'+act.id+'/messages?after='+first.seq,{token:b.token})).messages.length,0);
+ await api('/activities/'+act.id+'/messages',{token:c.token,method:'POST',body:message,status:403});
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{...message,senderId:b.id},status:422});
+ await api('/activities/'+act.id,{token:a.token,method:'DELETE'});
+ assert.deepEqual(await api('/activities',{token:b.token}),[]);
+ await api('/activities/'+act.id+'/messages',{token:b.token,method:'POST',body:message,status:410});
+ assert.equal((await api('/activities/'+act.id+'/messages',{token:b.token})).messages.length,1);
+ await send(a,cid,'Established chat still works','after-activity-end');
+});
+test('activities: expiry, host departure and moved-away eligibility preserve established chats',async()=>{
+ const {a,b,cid}=await pair();const act=await api('/activities',{token:a.token,method:'POST',body:activityInput({minutes:30}),status:201});
+ await runtime.db.collection('activities').updateOne({_id:act.id},{$set:{expiresAt:runtime.service.clock()-1}});
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST',status:410});await runtime.service.cleanup();
+ const stored=await runtime.db.collection('activities').findOne({_id:act.id});assert.equal(stored.status,'expired');assert.equal(stored.location,undefined);
+ const indefinite=await api('/activities',{token:a.token,method:'POST',body:activityInput({minutes:0}),status:201});assert.equal(indefinite.untilLeave,true);
+ await api('/presence',{token:a.token,method:'DELETE'});
+ assert.equal((await runtime.db.collection('activities').findOne({_id:indefinite.id})).status,'ended');
+ await send(b,cid,'Still chatting','after-live-end-01');
+});
+test('activities: block removes membership and denies further group interaction; reports keep group evidence',async()=>{
+ const {a,b}=await pair();const act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST'});
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{body:'Group evidence',clientId:'evidence-message'},status:201});
+ const report=await api('/reports',{token:b.token,method:'POST',body:{target:a.id,activityId:act.id,reason:'Review this activity message'},status:201});
+ assert.equal((await runtime.db.collection('reports').findOne({_id:report.id})).evidence[0].body,'Group evidence');
+ await api('/blocks',{token:a.token,method:'POST',body:{target:b.id}});
+ assert.deepEqual(await api('/activities',{token:b.token}),[]);
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST',status:404});
+ await api('/activities/'+act.id+'/messages',{token:b.token,status:404});
+ assert.equal((await api('/activities/'+act.id,{token:a.token})).participantCount,1);
+});
+test('activities: private anchor movement removes member and closes host activity',async()=>{
+ const {a,b,cid}=await pair(),act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST'});
+ // Trusted stored position simulates the location pipeline accepting physical travel, not mock bypass.
+ await runtime.db.collection('presence').updateOne({_id:b.id},{$set:{location:{type:'Point',coordinates:[-4.284,55.8885]}}});
+ await runtime.service.cleanup();assert.equal((await api('/activities/'+act.id,{token:a.token})).participantCount,1);
+ await runtime.db.collection('presence').updateOne({_id:a.id},{$set:{location:{type:'Point',coordinates:[-4.284,55.8885]}}});
+ await runtime.service.cleanup();assert.equal((await runtime.db.collection('activities').findOne({_id:act.id})).status,'ended');
+ await send(a,cid,'Established chat after travel','activity-travel-1');
+});
+test('activities: restart retains membership/history and reconnect retrieves missed group messages',async()=>{
+ const {a,b}=await pair(),act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ await api('/activities/'+act.id+'/join',{token:b.token,method:'POST'});
+ const first=await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{body:'Before restart',clientId:'restart-message-1'},status:201});
+ await runtime.close();runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+sequence,demoMode:true,rateLimits:false});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;
+ assert.equal((await api('/activities/'+act.id,{token:b.token})).joined,true);
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{body:'While away',clientId:'restart-message-2'},status:201});
+ const ws=wsClient(b.token);await ws.ready;
+ const missed=await api('/activities/'+act.id+'/messages?after='+first.seq,{token:b.token});assert.deepEqual(missed.messages.map(m=>m.body),['While away']);
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{body:'Connected again',clientId:'restart-message-3'},status:201});
+ await ws.next(e=>e.event==='activity.message'&&e.activityId===act.id);
+ assert.equal((await api('/activities/'+act.id+'/messages',{token:b.token})).messages.length,3);
+});
+test('activities: strict input rejects coordinates, owner spoofing, size abuse and replay content changes',async()=>{
+ const a=await user('Host');await enter(a);
+ for(const extra of [{location:{type:'Point',coordinates:[0,0]}},{creatorId:'b'.repeat(32)},{maxParticipants:31},{minutes:10000},{category:'Unsupported'}])await api('/activities',{token:a.token,method:'POST',body:activityInput(extra),status:422});
+ const act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ const message={body:'Original',clientId:'replay-content-1'};
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:message,status:201});
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{...message,body:'Changed'},status:409});
+ await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{...message,body:'x'.repeat(1001)},status:422});
 });

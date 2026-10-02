@@ -19,8 +19,7 @@ export const schemas = {
   choice: z.object({value:z.boolean()}).strict(),
   message: z.object({body:text(1,1000),clientId:z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/)}).strict(),
   read: z.object({messageIds:z.array(identifier).min(1).max(100)}).strict(),
-  activity: z.object({title:text(3,70),capacity:z.number().int().min(2).max(30),category:z.enum(['Friends','Sports']).default('Sports')}).strict(),
-  report: z.object({target:identifier,reason:text(5,1000)}).strict(),
+  report: z.object({target:identifier,activityId:identifier.optional(),reason:text(5,1000)}).strict(),
 };
 schemas.register = schemas.credentials.extend({name:text(1,30),gender:z.enum(['Male','Female','Non-binary','Prefer not to say']).default('Prefer not to say'),dob:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v=>Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0,10)===v,'Invalid date of birth'),interests:text(0,120).default('Coffee, music, outdoors')});
 // Node's established scrypt primitive; bounded work prevents concurrent hashes

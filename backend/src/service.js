@@ -1,3 +1,4 @@
+import {activityMethods} from './activities.js';
 import {SharedLimiter} from './security.js';
 import {registerPush,removePush,enqueuePush,pushLog} from './push.js';
 import { randomBytes } from 'node:crypto';
@@ -16,7 +17,7 @@ export class Service {
   async circleEvent(t,places){
     const people=await t.all('presence',{place_id:{$in:[...new Set(places)]},...this.active()});
     if(people.length)await this.emit(t,'circle.changed',people.map(p=>p._id));
-    await this.emit(t,'places.changed',null);
+
   }
   async assertPrincipal(t,principal){
     const token=await t.one('tokens',{_id:principal.hash,userId:principal.id,expiresAt:{$gt:new Date(this.clock()*1000)}});
@@ -75,8 +76,10 @@ export class Service {
   async endPresence(t,ids){
     if(!ids.length)return;
     const old=await t.all('presence',{_id:{$in:ids}});
-    await t.remove('activities',{owner:{$in:ids}});
-    await t.updateMany('activities',{},{$pull:{members:{$in:ids}}});
+    for(const a of await t.all('activities',{status:{$in:['active','full']},participantIds:{$in:ids}})){
+      if(ids.includes(a.creatorId))await this.finishActivity(t,a);
+      else for(const uid of ids)await this.removeActivityMember(t,await t.one('activities',{_id:a._id}),uid);
+    }
     await t.remove('presence',{_id:{$in:ids}});
     await this.emit(t,'presence.ended',ids);
     await this.circleEvent(t,old.map(p=>p.place_id));
@@ -85,6 +88,7 @@ export class Service {
     await t.remove('locations',{expiresAt:{$lte:new Date(this.clock()*1000)}});
     const expired=await t.all('presence',{$or:[{location:{$exists:false}},{expires:{$lte:this.clock()}},{checked:{$lte:this.clock()-LOCATION_LEASE_SECONDS}}]});
     await this.endPresence(t,expired.map(p=>p._id));
+    await this.reconcileActivities(t);
     const codes=await t.all('conversations',{codeExpires:{$lte:this.clock()}});
     for(const c of codes){await t.update('conversations',{_id:c._id},{$set:{readyA:false,readyB:false,code:null,codeExpires:null},$inc:{revision:1}});await this.emit(t,'meetup.changed',[c.a,c.b],{conversationId:c._id});}
     await t.remove('reports',{expiresAt:{$lte:new Date(this.clock()*1000)}});
@@ -146,6 +150,7 @@ export class Service {
 
         }
       }
+      await this.reconcileActivities(t,u._id);
       return {status:'trusted',expiresIn:LOCATION_LEASE_SECONDS,presenceEnded:ended,liveExpires:here&&!ended?(here.untilLeave?now+LOCATION_LEASE_SECONDS:here.expires):undefined};
     });
     if(result.status!=='trusted')fail(403,result.detail);
@@ -162,22 +167,6 @@ export class Service {
     const users=await t.all('users',{_id:{$in:rows.map(p=>p._id)},banned:false});const byId=new Map(users.map(u=>[u._id,u]));
     return rows.filter(p=>byId.has(p._id)).map(p=>({...anonymous(byId.get(p._id)),category:p.category}));
   }
-  async placeList(t,p){
-    const loc=await this.locationFor(t,p);if(!loc)return [];
-    const ps=await t.all('places',{location:this.geo(loc.location)},{sort:{name:1}}),result=[];
-    const blocked=await this.blockedIds(t,p.id);
-    const members=await t.all('presence',{...this.active(),place_id:{$in:ps.map(x=>x._id)},location:this.geo(loc.location)});
-    const activities=await t.all('activities',{place_id:{$in:ps.map(x=>x._id)},owner:{$in:members.filter(x=>!blocked.has(x._id)).map(x=>x._id)}});
-    for(const place of ps){
-      const categories={};
-      for(const other of members){
-        if(other.place_id!==place._id||other._id===p.id||blocked.has(other._id))continue;
-        categories[other.category]=(categories[other.category]||0)+1;
-      }
-      result.push({id:place._id,name:place.name,description:place.description,landmark:place.landmark,count:Object.values(categories).reduce((a,b)=>a+b,0),categories,activityCount:activities.filter(a=>a.place_id===place._id).length});
-    }return result;
-  }
-  async places(p){return this.execute(p,false,t=>this.placeList(t,p));}
   async verifyPlace(t,placeId,loc){if(!placeId)return;
     const place=await t.one('places',{_id:placeId});if(!place)fail(404,'Place not found.');
     if(distance(loc.location.coordinates[1],loc.location.coordinates[0],place.lat,place.lon)>Math.min(place.radius,1000))fail(403,'You need to be inside this place to enter its Live Circle. You can still go live Around you.');
@@ -338,33 +327,6 @@ export class Service {
     await t.remove('messages',{conversationId:cid});await t.remove('conversations',{_id:cid});
     await this.emit(t,'chat.ended',[c.a,c.b],{conversationId:cid});return {ok:true};
   });}
-  async activitiesView(t,uid){
-    const here=await t.one('presence',{_id:uid,...this.active()});if(!here||!here.place_id)return [];
-    const activities=await t.all('activities',{place_id:here.place_id,expires:{$gt:this.clock()}});if(!activities.length)return [];
-    const ids=[...new Set(activities.flatMap(a=>[a.owner,...a.members]))];
-    const active=new Map((await t.all('presence',{_id:{$in:ids},place_id:here.place_id,...this.active()})).map(p=>[p._id,p]));
-    const blocked=await this.blockedIds(t,uid),place=await t.one('places',{_id:here.place_id});
-    const result=[];for(const a of activities){const owner=active.get(a.owner);if(!owner||!this.closeEnough(here,owner))continue;
-      const members=a.members.filter(m=>active.has(m));if(members.some(m=>blocked.has(m)))continue;
-      result.push({id:a._id,title:a.title,category:a.category,capacity:a.capacity,count:members.length,joined:members.includes(uid),isOwner:a.owner===uid,landmark:place?.landmark||'Agree on a public meeting place in chat.'});
-    }return result;
-  }
-  async activities(p){return this.execute(p,false,async(t,u)=>await this.locationFor(t,p)?this.activitiesView(t,u._id):[]);}
-  async createActivity(p,input){await this.limits.take('createActivity:'+p.id,10,60000);const d=schemas.activity.parse(input);return this.execute(p,true,async(t,u)=>{
-    await this.requireLocation(t,p);const here=await this.live(t,u._id);if(!here.place_id)fail(409,'Enter a Live Place to host a venue activity.');if(await t.count('activities',{owner:u._id})>=3)fail(409,'You can host up to three live activities.');
-    const aid=id();await t.insert('activities',{_id:aid,owner:u._id,place_id:here.place_id,...d,expires:here.expires,members:[u._id]});
-    await this.circleEvent(t,[here.place_id]);return {id:aid};
-  });}
-  async joinActivity(p,aid){identifier.parse(aid);await this.limits.take('joinActivity:'+p.id,30,60000);return this.execute(p,true,async(t,u)=>{
-    await this.requireLocation(t,p);const here=await this.live(t,u._id),a=await t.one('activities',{_id:aid,place_id:here.place_id});if(!a)fail(404,'Activity unavailable.');
-    const owner=await t.one('presence',{_id:a.owner,...this.active()});if(!owner||!this.closeEnough(here,owner))fail(404,'Activity unavailable.');
-    for(const member of a.members)if(await this.blocked(t,u._id,member))fail(404,'Activity unavailable.');
-    if(a.members.includes(u._id))return {ok:true};if(a.members.length>=a.capacity)fail(409,'This activity is full.');
-    await t.update('activities',{_id:aid},{$addToSet:{members:u._id}});await this.circleEvent(t,[here.place_id]);return {ok:true};
-  });}
-  async leaveActivity(p,aid){identifier.parse(aid);return this.execute(p,true,async(t,u)=>{
-    const a=await t.one('activities',{_id:aid});if(a){if(!a.members.includes(u._id)&&a.owner!==u._id)fail(404,'Activity unavailable.');if(a.owner===u._id)await t.remove('activities',{_id:aid});else await t.update('activities',{_id:aid},{$pull:{members:u._id}});await this.circleEvent(t,[a.place_id]);}return {ok:true};
-  });}
   async blocksView(t,uid){const blocks=await t.all('blocks',{owner:uid});if(!blocks.length)return [];return (await t.all('users',{_id:{$in:blocks.map(b=>b.target)}},{projection:{alias:1}})).map(u=>({id:u._id,alias:u.alias}));}
   async blocks(p){return this.execute(p,false,(t,u)=>this.blocksView(t,u._id));}
   async block(p,input){await this.limits.take('block:'+p.id,20,60000);const {target}=schemas.target.parse(input);return this.execute(p,true,async(t,u)=>{
@@ -372,21 +334,26 @@ export class Service {
     await t.update('blocks',{owner:u._id,target},{$setOnInsert:{_id:id(),owner:u._id,target}},{upsert:true});
     const pair=[u._id,target].sort(),c=await t.one('conversations',{a:pair[0],b:pair[1]});
     if(c){await t.remove('messages',{conversationId:c._id});await t.remove('conversations',{_id:c._id});await this.emit(t,'chat.ended',pair,{conversationId:c._id});}
-    await t.updateMany('activities',{owner:u._id},{$pull:{members:target}});await t.updateMany('activities',{owner:target},{$pull:{members:u._id}});
+    for(const a of await t.all('activities',{status:{$in:['active','full']},participantIds:{$all:[u._id,target]}})){
+      await this.removeActivityMember(t,a,a.creatorId===u._id?target:u._id);
+    }
     const here=await t.one('presence',{_id:u._id});if(here)await this.circleEvent(t,[here.place_id]);await this.emit(t,'safety.changed',pair);return {ok:true};
   });}
   async unblock(p,target){identifier.parse(target);return this.execute(p,true,async(t,u)=>{await t.remove('blocks',{owner:u._id,target});const here=await t.one('presence',{_id:u._id});if(here)await this.circleEvent(t,[here.place_id]);await this.emit(t,'safety.changed',[u._id,target]);return {ok:true};});}
   async report(p,input){await this.limits.take('report:'+p.id,5,3600000);const d=schemas.report.parse(input);return this.execute(p,true,async(t,u)=>{
     if(d.target===u._id||!await t.one('users',{_id:d.target}))fail(422,'Invalid person.');
     const pair=[u._id,d.target].sort(),c=await t.one('conversations',{a:pair[0],b:pair[1]});
-    const evidence=c?await t.all('messages',{conversationId:c._id},{sort:{created:-1},limit:30}):[];
+    let evidence=c?await t.all('messages',{conversationId:c._id},{sort:{created:-1},limit:30}):[];
+    if(d.activityId){const a=await this.activityAccess(t,p,d.activityId,{member:true,allowEnded:true});if(!a.participantIds.includes(d.target))fail(422,'Invalid activity participant.');evidence=await t.all('activityMessages',{activityId:a._id},{sort:{seq:-1},limit:30});}
     const rid=id();await t.insert('reports',{_id:rid,reporter:u._id,target:d.target,reason:d.reason,evidence:evidence.map(m=>({sender:m.sender,body:m.body,created:m.created})),created:this.clock(),expiresAt:new Date((this.clock()+30*86400)*1000),status:'open'});return {id:rid,message:'Report saved for review.'};
   });}
   async state(p){return this.execute(p,false,async(t,u)=>{
     const loc=await this.locationFor(t,p),here=await t.one('presence',{_id:u._id,...this.active()});
     const nearby=loc?await this.nearbyPeople(t,u._id,loc):[];
     const categories={};for(const person of nearby)categories[person.category]=(categories[person.category]||0)+1;
-    return {me:own(u),locationReady:!!loc,nearby:{count:nearby.length,categories},places:await this.placeList(t,p),circle:loc?await this.circleView(t,u._id):{presence:null,people:[]},chats:await this.chatList(t,u._id),activities:loc?await this.activitiesView(t,u._id):[],blocks:await this.blocksView(t,u._id)};
+    return {me:own(u),locationReady:!!loc,nearby:{count:nearby.length,categories},circle:loc?await this.circleView(t,u._id):{presence:null,people:[]},chats:await this.chatList(t,u._id),activities:loc?await this.activitiesView(t,p):[],blocks:await this.blocksView(t,u._id)};
   });}
   async ban(uid){return transaction(this.client,this.db,true,async t=>{await t.update('users',{_id:uid},{$set:{banned:true}});await this.endPresence(t,[uid]);const chats=await t.all('conversations',{$or:[{a:uid},{b:uid}]});await t.remove('messages',{conversationId:{$in:chats.map(c=>c._id)}});await t.remove('conversations',{_id:{$in:chats.map(c=>c._id)}});for(const c of chats)await this.emit(t,'chat.ended',[c.a,c.b],{conversationId:c._id});await t.remove('locations',{_id:uid});await t.remove('tokens',{userId:uid});await this.emit(t,'session.revoked',[uid]);});}
 }
+
+Object.assign(Service.prototype,activityMethods);

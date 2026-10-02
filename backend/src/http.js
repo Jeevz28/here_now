@@ -28,7 +28,6 @@ export function createHttpApp(service,{origins=[],rateLimits=true,trust=()=>fals
   route('patch','/me',(p,r)=>service.profile(p,r.body));
   route('delete','/me',p=>service.deleteMe(p));
   route('post','/auth/logout',p=>service.logout(p));
-  route('get','/places',p=>service.places(p));
   route('post','/presence',(p,r)=>service.enter(p,r.body));
   route('post','/presence/heartbeat',(p,r)=>service.heartbeat(p,r.body));
   route('post','/presence/extend',(p,r)=>service.extendLive(p,r.body));
@@ -45,6 +44,10 @@ export function createHttpApp(service,{origins=[],rateLimits=true,trust=()=>fals
   route('post','/conversations/:cid/messages',(p,r)=>service.sendMessage(p,r.params.cid,r.body),201);
   route('post','/conversations/:cid/vibe',(p,r)=>service.vibe(p,r.params.cid,r.body));
   route('post','/conversations/:cid/ready',(p,r)=>service.ready(p,r.params.cid,r.body));
+  route('get','/activities/:aid',(p,r)=>service.activityDetails(p,r.params.aid));
+  route('delete','/activities/:aid',(p,r)=>service.endActivity(p,r.params.aid));
+  route('get','/activities/:aid/messages',(p,r)=>service.activityMessages(p,r.params.aid,r.query.after));
+  route('post','/activities/:aid/messages',(p,r)=>service.sendActivityMessage(p,r.params.aid,r.body),201);
   route('get','/activities',p=>service.activities(p));
   route('post','/activities',(p,r)=>service.createActivity(p,r.body),201);
   route('post','/activities/:aid/join',(p,r)=>service.joinActivity(p,r.params.aid));

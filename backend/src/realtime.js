@@ -77,7 +77,7 @@ export async function attachRealtime(server,service,{origins=[],authTimeoutMs=50
           else await service.authenticateHash(ws.principal.hash);
         }catch(error){if(error.status===401){expire(ws);return;}if(![403,404].includes(error.status))ws.close(1012,'Resynchronize state');return;}
         if(e.event==='session.revoked'){expire(ws);return;}
-        metric('ws.outboxToSend',Date.now()-new Date(e.createdAt).getTime());send(ws,{type:'event',event:e.event,id:e._id,...(e.conversationId?{conversationId:e.conversationId}:{}),...data});
+        metric('ws.outboxToSend',Date.now()-new Date(e.createdAt).getTime());send(ws,{type:'event',event:e.event,id:e._id,...(e.activityId?{activityId:e.activityId}:{}),...(e.conversationId?{conversationId:e.conversationId}:{}),...data});
       }));
     }
   }

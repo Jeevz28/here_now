@@ -7,7 +7,7 @@ export async function connectDatabase(uri, name) {
   const hello=await client.db('admin').command({hello:1});
   if(!hello.setName && hello.msg!=='isdbgrid'){await client.close();throw new Error('HereNow needs a MongoDB replica set for transactions and live change streams. Use the included Docker Compose setup or MongoDB Atlas.');}
   const db=client.db(name);
-  for(const collection of ['users','tokens','places','presence','conversations','messages','activities','blocks','reports','events','control','locations','locationRisks','pushDevices','pushJobs','rateLimits']) {
+  for(const collection of ['users','tokens','places','presence','conversations','messages','activities','activityMessages','blocks','reports','events','control','locations','locationRisks','pushDevices','pushJobs','rateLimits']) {
     try{await db.createCollection(collection);}catch(e){if(e.code!==48)throw e;}
   }
   await db.collection('rateLimits').createIndex({expiresAt:1},{expireAfterSeconds:0});
@@ -33,16 +33,21 @@ export async function connectDatabase(uri, name) {
   await db.collection('messages').createIndex({conversationId:1,read:1,sender:1});
   await db.collection('messages').createIndex({sender:1,created:1});
   await db.collection('messages').createIndex({conversationId:1,seq:1});
-  await db.collection('activities').createIndex({place_id:1});
+  await db.collection('locations').createIndex({location:'2dsphere'});
+  await db.collection('activities').createIndex({location:'2dsphere',status:1,expiresAt:1});
+  await db.collection('activities').createIndex({creatorId:1,status:1,expiresAt:1});
+  await db.collection('activities').createIndex({participantIds:1,status:1});
+  await db.collection('activities').createIndex({creatorId:1,clientId:1},{unique:true,partialFilterExpression:{clientId:{$type:'string'}}});
+  await db.collection('activities').createIndex({purgeAt:1},{expireAfterSeconds:0});
+  await db.collection('activityMessages').createIndex({activityId:1,sender:1,clientId:1},{unique:true});
+  await db.collection('activityMessages').createIndex({activityId:1,seq:1});
+  await db.collection('activityMessages').createIndex({expiresAt:1},{expireAfterSeconds:0});
+  // Obsolete venue activities have no private anchor; retire rather than publish.
+  await db.collection('activities').deleteMany({creatorId:{$exists:false}});
   await db.collection('blocks').createIndex({owner:1,target:1},{unique:true});
   await db.collection('reports').createIndex({expiresAt:1},{expireAfterSeconds:0});
   await db.collection('events').createIndex({expiresAt:1},{expireAfterSeconds:0});
   await db.collection('control').updateOne({_id:'consistency'},{$setOnInsert:{revision:0}},{upsert:true});
-  for(const p of [
-    {_id:'kelvingrove',name:'Kelvingrove Park',description:'Open lawns, new connections.',lat:55.8685,lon:-4.2840,radius:700,landmark:'Main park entrance on Kelvin Way'},
-    {_id:'glasgow-green',name:'Glasgow Green',description:'A little fresh air. A new circle.',lat:55.851,lon:-4.238,radius:850,landmark:'Outside the People’s Palace entrance'},
-    {_id:'george-square',name:'George Square',description:'A city break, together.',lat:55.8612,lon:-4.2502,radius:350,landmark:'Main entrance to the City Chambers'}
-  ])await db.collection('places').updateOne({_id:p._id},{$setOnInsert:p},{upsert:true});
   // Idempotent migration of existing curated places.
   for(const p of await db.collection('places').find({}).toArray()) {
     await db.collection('places').updateOne({_id:p._id},{$set:{location:{type:'Point',coordinates:[p.lon,p.lat]}}});
