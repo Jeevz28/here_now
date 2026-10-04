@@ -1,3 +1,4 @@
+import {datingCompatible,requireDatingPreference} from './dating.js';
 import {activityMethods} from './activities.js';
 import {SharedLimiter} from './security.js';
 import {registerPush,removePush,enqueuePush,pushLog} from './push.js';
@@ -56,7 +57,7 @@ export class Service {
     return transaction(this.client,this.db,true,async t=>{
       if(await t.one('users',{email:data.email}))fail(409,'Unable to register with these details. Try signing in.');
       const uid=id();const words=['Curious Otter','Sunny Fox','Kind Panda','Cosmic Robin','Mellow Koala','Bright Owl'];
-      await t.insert('users',{_id:uid,email:data.email,password,name:data.name,dob:data.dob,gender:data.gender,interests:data.interests,alias:words[randomBytes(1)[0]%words.length]+' '+randomBytes(2).toString('hex').toUpperCase(),banned:false});
+      await t.insert('users',{_id:uid,email:data.email,password,name:data.name,dob:data.dob,gender:data.gender,...(data.datingPreference?{datingPreference:data.datingPreference}:{}),interests:data.interests,alias:words[randomBytes(1)[0]%words.length]+' '+randomBytes(2).toString('hex').toUpperCase(),banned:false});
       return this.issue(t,uid);
     });
   }
@@ -163,19 +164,32 @@ export class Service {
   }
   async nearbyPeople(t,uid,loc,category){
     const blocked=await this.blockedIds(t,uid);
-    const rows=(await t.all('presence',{...this.active(),_id:{$ne:uid},location:this.geo(loc.location)})).filter(p=>!blocked.has(p._id)&&(!category||((p.category==='Dating')===(category==='Dating'))));
+    const rows=(await t.all('presence',{...this.active(),_id:{$ne:uid},location:this.geo(loc.location)})).filter(p=>!blocked.has(p._id)&&(!category||p.category===category));
     const users=await t.all('users',{_id:{$in:rows.map(p=>p._id)},banned:false});const byId=new Map(users.map(u=>[u._id,u]));
-    return rows.filter(p=>byId.has(p._id)).map(p=>({...anonymous(byId.get(p._id)),category:p.category}));
+    const viewer=await t.one('users',{_id:uid});
+    return rows.filter(p=>byId.has(p._id)&&(p.category!=='Dating'||datingCompatible(viewer,byId.get(p._id)))).map(p=>({...anonymous(byId.get(p._id)),category:p.category}));
   }
   async verifyPlace(t,placeId,loc){if(!placeId)return;
     const place=await t.one('places',{_id:placeId});if(!place)fail(404,'Place not found.');
     if(distance(loc.location.coordinates[1],loc.location.coordinates[0],place.lat,place.lon)>Math.min(place.radius,1000))fail(403,'You need to be inside this place to enter its Live Circle. You can still go live Around you.');
   }
   async enter(p,input){await this.limits.take('enter:'+p.id,10,60000);const d=schemas.presence.parse(input);if(input.demo)fail(403,'Demo location bypass is no longer supported.');return this.execute(p,true,async(t,u)=>{
+    if(d.category==='Dating')requireDatingPreference(u);
     const loc=await this.requireLocation(t,p);await this.verifyPlace(t,d.placeId,loc);await this.endPresence(t,[u._id]);
     const sessionId=id(),expiry=this.clock()+(d.minutes===0?LOCATION_LEASE_SECONDS:d.minutes*60);
     await t.insert('presence',{_id:u._id,user_id:u._id,place_id:d.placeId,category:d.category,untilLeave:d.minutes===0,expires:expiry,checked:loc.checked,location:loc.location,liveSessionId:sessionId,tokenHash:p.hash});
     await this.circleEvent(t,[d.placeId]);return {ok:true,liveSessionId:sessionId,expires:expiry};
+  });}
+  async datingPreference(p,input){const d=schemas.datingPreference.parse(input);await this.limits.take('datingPreference:'+p.id,20,60000);return this.execute(p,true,async(t,u)=>{
+    await t.update('users',{_id:u._id},{$set:d});const here=await t.one('presence',{_id:u._id});if(here)await this.circleEvent(t,[here.place_id]);await this.emit(t,'profile.changed',[u._id]);return own({...u,...d});
+  });}
+  async changeIntent(p,input){const d=schemas.intent.parse(input);await this.limits.take('changeIntent:'+p.id,20,60000);return this.execute(p,true,async(t,u)=>{
+    const here=await this.live(t,u._id);await this.requireLocation(t,p);
+    if(here.tokenHash!==p.hash||here.liveSessionId!==d.liveSessionId)fail(409,'This Live session has changed.');
+    if(d.category==='Dating')requireDatingPreference(u);
+    await t.update('presence',{_id:u._id},{$set:{category:d.category}});
+    await this.circleEvent(t,[here.place_id]);await this.emit(t,'presence.changed',[u._id]);
+    return this.circleView(t,u._id);
   });}
   async heartbeat(p,input){schemas.presence.parse(input||{});await this.limits.take('heartbeat:'+p.id,20,60000);return this.execute(p,true,async(t,u)=>{
     const here=await this.live(t,u._id),loc=await this.requireLocation(t,p);
@@ -285,7 +299,8 @@ export class Service {
   async startChat(p,input){await this.limits.take('startChat:'+p.id,15,60000);const {target}=schemas.target.parse(input);return this.execute(p,true,async(t,u)=>{
     await this.requireLocation(t,p);if(target===u._id)fail(422,'Choose someone else.');const a=await this.live(t,u._id),b=await this.live(t,target);
     if(!this.closeEnough(a,b)||await this.blocked(t,u._id,target))fail(403,'This person is unavailable.');
-    if((a.category==='Dating')!==(b.category==='Dating'))fail(403,'Both people must choose Dating.');
+    if(a.category!==b.category)fail(403,'Choose the same intent to start a new conversation.');
+    if(a.category==='Dating'&&!datingCompatible(u,await t.one('users',{_id:target,banned:false})))fail(403,'This person is unavailable.');
     const pair=[u._id,target].sort();let c=await t.one('conversations',{a:pair[0],b:pair[1]});
     if(!c){c={_id:id(),status:'active',a:pair[0],b:pair[1],place_id:a.place_id,vibeA:false,vibeB:false,readyA:false,readyB:false,code:null,codeExpires:null};await t.insert('conversations',c);await this.emit(t,'chat.created',pair,{conversationId:c._id});}
     return {id:c._id};

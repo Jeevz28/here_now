@@ -15,7 +15,7 @@ beforeEach(async()=>{deliveries=[];pushFailure=null;runtime=await createApplicat
 afterEach(async()=>{for(const ws of sockets.splice(0))ws.terminate();await runtime.close();});
 after(async()=>{await mongo?.stop();if(folder)await rm(folder,{recursive:true,force:true});});
 async function api(path,{token,method='GET',body,status=200}={}){const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},...(body!==undefined?{body:JSON.stringify(body)}:{})});const data=await r.json();assert.equal(r.status,status,JSON.stringify(data));return data;}
-async function user(name){const {token}=await api('/auth/register',{method:'POST',body:{name,email:name.toLowerCase()+'@example.com',password:'Testing12345!',dob:'1997-06-15'},status:201});return {token,id:(await api('/me',{token})).id};}
+async function user(name,extra={}){const {token}=await api('/auth/register',{method:'POST',body:{name,email:name.toLowerCase()+'@example.com',password:'Testing12345!',dob:'1997-06-15',datingPreference:'Everyone',...extra},status:201});return {token,id:(await api('/me',{token})).id};}
 const live={placeId:'kelvingrove',category:'Friends',minutes:60,lat:0,lon:0,demo:true};
 async function fix(u,lat=55.8685,lon=-4.284,extra={},status=200){return api('/location',{token:u.token,method:'POST',body:{lat,lon,accuracy:10,timestamp:Date.now(),mocked:false,servicesEnabled:true,permissionGranted:true,...extra},status});}
 async function enter(u,extra={}){const d={...live,...extra,demo:false};const coords={'kelvingrove':[55.8685,-4.284],'george-square':[55.8612,-4.2502]};await fix(u,...(coords[d.placeId]||[55.8685,-4.284]));return api('/presence',{token:u.token,method:'POST',body:d});}
@@ -489,4 +489,49 @@ test('activities: strict input rejects coordinates, owner spoofing, size abuse a
  await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:message,status:201});
  await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{...message,body:'Changed'},status:409});
  await api('/activities/'+act.id+'/messages',{token:a.token,method:'POST',body:{...message,body:'x'.repeat(1001)},status:422});
+});
+test('dating: missing preference prompts without ending current Live; strict own preference endpoint',async()=>{
+ const a=await user('Legacy',{datingPreference:undefined});await enter(a);const before=(await api('/circle',{token:a.token})).presence;
+ await api('/presence',{token:a.token,method:'POST',body:{category:'Dating'},status:409});
+ await api('/presence/intent',{token:a.token,method:'PATCH',body:{liveSessionId:before.liveSessionId,category:'Dating'},status:409});
+ assert.equal((await api('/circle',{token:a.token})).presence.liveSessionId,before.liveSessionId);
+ assert.equal((await api('/me',{token:a.token})).datingPreference,null);
+ await api('/me/dating-preference',{token:a.token,method:'PATCH',body:{datingPreference:'Women',userId:'b'.repeat(32)},status:422});
+ const own=await api('/me/dating-preference',{token:a.token,method:'PATCH',body:{datingPreference:'Women'}});assert.equal(own.datingPreference,'Women');
+ const next=await api('/presence/intent',{token:a.token,method:'PATCH',body:{liveSessionId:before.liveSessionId,category:'Dating'}});assert.equal(next.presence.category,'Dating');assert.equal(next.presence.expires,before.expires);
+});
+test('dating: API discovery matrix enforces all mutual combinations and hides preference',async()=>{
+ const genders=['Male','Female','Non-binary','Prefer not to say'],allowed={Men:['Male'],Women:['Female'],'Men & Women':['Male','Female'],Everyone:genders},users=[];
+ for(const gender of genders)for(const datingPreference of Object.keys(allowed)){const u=await user('Matrix'+users.length,{gender,datingPreference});await enter(u,{placeId:null,category:'Dating'});users.push({...u,gender,datingPreference});}
+ for(const a of users){const people=(await api('/circle',{token:a.token})).people;
+  const expected=users.filter(b=>b.id!==a.id&&allowed[a.datingPreference].includes(b.gender)&&allowed[b.datingPreference].includes(a.gender));
+  assert.deepEqual(people.map(p=>p.id).sort(),expected.map(p=>p.id).sort());
+  for(const p of people)for(const key of ['datingPreference','email','dob','coordinates','location'])assert.equal(p[key],undefined);
+ }
+ const a=users.find(u=>u.gender==='Male'&&u.datingPreference==='Women'),b=users.find(u=>u.gender==='Female'&&u.datingPreference==='Women');
+ await api('/conversations',{token:a.token,method:'POST',body:{target:b.id},status:403});
+});
+test('intent: exact category, in-place change, peer events and chat/activity preservation',async()=>{
+ const {a,b,cid}=await pair();const act=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ const before=(await api('/circle',{token:a.token})).presence,ws=wsClient(b.token);await ws.ready;
+ const circle=await api('/presence/intent',{token:a.token,method:'PATCH',body:{liveSessionId:before.liveSessionId,category:'Sports'}});
+ assert.equal(circle.presence.liveSessionId,before.liveSessionId);assert.equal(circle.presence.expires,before.expires);assert.deepEqual(circle.people,[]);
+ await ws.next(e=>e.event==='circle.changed');assert.deepEqual((await api('/circle',{token:b.token})).people,[]);
+ assert.equal((await api('/activities/'+act.id,{token:a.token})).status,'active');await send(a,cid,'Chat survives intent','intent-keep-chat');
+ await api('/presence/intent',{token:b.token,method:'PATCH',body:{liveSessionId:before.liveSessionId,category:'Sports'},status:409});
+ await api('/presence/intent',{token:a.token,method:'PATCH',body:{liveSessionId:before.liveSessionId,category:'Friends'}});
+ assert.equal((await api('/circle',{token:a.token})).people[0].id,b.id);
+ await runtime.db.collection('presence').updateOne({_id:a.id},{$set:{expires:runtime.service.clock()-1}});
+ await api('/presence/intent',{token:a.token,method:'PATCH',body:{liveSessionId:before.liveSessionId,category:'Sports'},status:409});
+});
+test('dating: radius, preference updates and restart remain authoritative',async()=>{
+ const a=await user('Man',{gender:'Male',datingPreference:'Women'}),b=await user('Woman',{gender:'Female',datingPreference:'Men'});
+ for(const u of [a,b])await enter(u,{placeId:null,category:'Dating'});
+ assert.equal((await api('/circle',{token:a.token})).people.length,1);
+ await runtime.db.collection('presence').updateOne({_id:b.id},{$set:{location:{type:'Point',coordinates:[-4.284,55.8885]}}});
+ assert.equal((await api('/circle',{token:a.token})).people.length,0);await api('/conversations',{token:a.token,method:'POST',body:{target:b.id},status:403});
+ await runtime.db.collection('presence').updateOne({_id:b.id},{$set:{location:{type:'Point',coordinates:[-4.284,55.8685]}}});
+ const ws=wsClient(a.token);await ws.ready;await api('/me/dating-preference',{token:b.token,method:'PATCH',body:{datingPreference:'Women'}});await ws.next(e=>e.event==='circle.changed');assert.equal((await api('/circle',{token:a.token})).people.length,0);
+ ws.ws.terminate();await runtime.close();runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+sequence,demoMode:true,rateLimits:false});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;
+ assert.equal((await api('/me',{token:b.token})).datingPreference,'Women');assert.equal((await api('/circle',{token:a.token})).presence.category,'Dating');assert.equal((await api('/circle',{token:a.token})).people.length,0);
 });

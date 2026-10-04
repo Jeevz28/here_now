@@ -25,6 +25,8 @@ export function createHttpApp(service,{origins=[],rateLimits=true,trust=()=>fals
   route('delete','/location',(p,r)=>service.revokeLocation(p,r.body));
   route('get','/state',p=>service.state(p));
   route('get','/me',p=>service.me(p));
+  route('patch','/me/dating-preference',(p,r)=>service.datingPreference(p,r.body));
+  route('patch','/presence/intent',(p,r)=>service.changeIntent(p,r.body));
   route('patch','/me',(p,r)=>service.profile(p,r.body));
   route('delete','/me',p=>service.deleteMe(p));
   route('post','/auth/logout',p=>service.logout(p));

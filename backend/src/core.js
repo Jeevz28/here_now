@@ -13,6 +13,8 @@ export const schemas = {
   profile: z.object({ name: text(1, 30), interests: text(0, 120) }).strict(),
   location: z.object({lat:z.number().finite().min(-90).max(90),lon:z.number().finite().min(-180).max(180),accuracy:z.number().finite().min(0),timestamp:z.number().finite(),mocked:z.boolean(),servicesEnabled:z.boolean(),permissionGranted:z.boolean(),liveSessionId:identifier.optional()}).strict(),
   presence: z.object({placeId:text(1,80).nullable().default(null),category:z.enum(['Friends','Dating','Sports','Pets','Social','Gaming']),minutes:z.union([z.literal(0),z.literal(30),z.literal(60),z.literal(120)]).default(60),lat:z.number().finite().min(-90).max(90).optional(),lon:z.number().finite().min(-180).max(180).optional(),demo:z.boolean().optional()}).strict(),
+  datingPreference:z.object({datingPreference:z.enum(['Men','Women','Men & Women','Everyone'])}).strict(),
+  intent:z.object({liveSessionId:identifier,category:z.enum(['Friends','Dating','Sports','Pets','Social','Gaming'])}).strict(),
   revoke:z.object({liveSessionId:identifier.optional()}).strict(),
   extension:z.object({liveSessionId:identifier,requestId:z.string().regex(/^[a-zA-Z0-9_-]{8,100}$/)}).strict(),
   target: z.object({target:identifier}).strict(),
@@ -21,7 +23,7 @@ export const schemas = {
   read: z.object({messageIds:z.array(identifier).min(1).max(100)}).strict(),
   report: z.object({target:identifier,activityId:identifier.optional(),reason:text(5,1000)}).strict(),
 };
-schemas.register = schemas.credentials.extend({name:text(1,30),gender:z.enum(['Male','Female','Non-binary','Prefer not to say']).default('Prefer not to say'),dob:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v=>Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0,10)===v,'Invalid date of birth'),interests:text(0,120).default('Coffee, music, outdoors')});
+schemas.register = schemas.credentials.extend({name:text(1,30),datingPreference:z.enum(['Men','Women','Men & Women','Everyone']).optional(),gender:z.enum(['Male','Female','Non-binary','Prefer not to say']).default('Prefer not to say'),dob:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v=>Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0,10)===v,'Invalid date of birth'),interests:text(0,120).default('Coffee, music, outdoors')});
 // Node's established scrypt primitive; bounded work prevents concurrent hashes
 // exhausting a small API container. Existing hashes upgrade after successful login.
 let activeHashes=0;const hashQueue=[];
@@ -47,7 +49,7 @@ export function age(dob, now=new Date()) {
   if(now.getUTCMonth()<born.getUTCMonth() || (now.getUTCMonth()===born.getUTCMonth() && now.getUTCDate()<born.getUTCDate())) n--;
   return n;
 }
-export function own(u) {return {id:u._id,name:u.name,email:u.email,alias:u.alias,gender:u.gender||'Prefer not to say',interests:u.interests};}
+export function own(u) {return {id:u._id,name:u.name,email:u.email,alias:u.alias,datingPreference:u.datingPreference||null,gender:u.gender||'Prefer not to say',interests:u.interests};}
 export function anonymous(u) {const n=age(u.dob),start=Math.max(18,Math.floor(n/5)*5);return {id:u._id,alias:u.alias,gender:u.gender||'Prefer not to say',ageRange:`${start}–${Math.floor(n/5)*5+4}`,interests:u.interests};}
 export function distance(a,b,c,d) {
   const r=Math.PI/180;const x=Math.sin((a-c)*r/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin((b-d)*r/2)**2;
