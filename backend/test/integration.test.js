@@ -535,3 +535,27 @@ test('dating: radius, preference updates and restart remain authoritative',async
  ws.ws.terminate();await runtime.close();runtime=await createApplication({mongoUri:mongo.getUri(),dbName:'test'+sequence,demoMode:true,rateLimits:false});await runtime.listen(0,'127.0.0.1');base='http://127.0.0.1:'+runtime.server.address().port;
  assert.equal((await api('/me',{token:b.token})).datingPreference,'Women');assert.equal((await api('/circle',{token:a.token})).presence.category,'Dating');assert.equal((await api('/circle',{token:a.token})).people.length,0);
 });
+
+test('activities: concurrent creates enforce one active host, retries remain idempotent, multiple joins allowed',async()=>{
+ const {a,b}=await pair(),c=await user('ThirdHost');await enter(c);
+ const inputs=Array.from({length:5},(_,i)=>activityInput({clientId:'parallel-host-'+i}));
+ const replies=await Promise.all(inputs.map(body=>fetch(base+'/activities',{method:'POST',headers:{Authorization:'Bearer '+a.token,'Content-Type':'application/json'},body:JSON.stringify(body)})));
+ assert.deepEqual(replies.map(r=>r.status).sort(),[201,409,409,409,409]);
+ const winner=replies.findIndex(r=>r.status===201),created=await replies[winner].json();
+ assert.equal((await api('/activities',{token:a.token,method:'POST',body:inputs[winner],status:201})).id,created.id);
+ assert.equal(await runtime.db.collection('activities').countDocuments({creatorId:a.id,status:{$in:['active','full']}}),1);
+ const other=await api('/activities',{token:c.token,method:'POST',body:activityInput(),status:201});
+ await api('/activities/'+created.id+'/join',{token:b.token,method:'POST'});await api('/activities/'+other.id+'/join',{token:b.token,method:'POST'});
+ assert.equal((await api('/activities',{token:b.token})).filter(x=>x.joined).length,2);
+ await api('/activities/'+created.id+'/messages',{token:a.token,method:'POST',body:{body:'History survives replacement',clientId:'replace-history-1'},status:201});
+ await api('/activities/'+created.id,{token:a.token,method:'DELETE'});
+ await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ assert.equal((await api('/activities/'+created.id+'/messages',{token:a.token})).messages[0].body,'History survives replacement');
+});
+test('activities: expired host slot is reclaimed transactionally without deleting history',async()=>{
+ const a=await user('ExpiringHost');await enter(a);const old=await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ await runtime.db.collection('activities').updateOne({_id:old.id},{$set:{expiresAt:Date.now()/1000-1}});
+ await api('/activities',{token:a.token,method:'POST',body:activityInput(),status:201});
+ assert.equal((await runtime.db.collection('activities').findOne({_id:old.id})).status,'expired');
+ assert.equal(await runtime.db.collection('activities').countDocuments({creatorId:a.id,status:{$in:['active','full']}}),1);
+});

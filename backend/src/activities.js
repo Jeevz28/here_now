@@ -65,7 +65,10 @@ export const activityMethods={
    if(here.tokenHash!==p.hash)fail(403,'Use the account session that started Live.');
    const previous=await t.one('activities',{creatorId:u._id,clientId:d.clientId});
    if(previous)return this.activityDTO(previous,u._id);
-   if(await t.count('activities',{creatorId:u._id,...active,expiresAt:{$gt:this.clock()}})>=3)fail(409,'You can host up to three active activities.');
+   // execute(write=true) acquires the shared MongoDB revision fence before this read.
+   // Concurrent requests therefore retry against the committed activity, not a stale count.
+   await this.reconcileActivities(t,u._id);
+   if(await t.count('activities',{creatorId:u._id,...active,expiresAt:{$gt:this.clock()}})>=1)fail(409,'You already have something going. End your current activity before starting another.');
    const a={_id:id(),creatorId:u._id,clientId:d.clientId,category:d.category,title:d.title,description:d.description,location:loc.location,maxParticipants:d.maxParticipants,participantIds:[u._id],participantCount:1,createdAt:this.clock(),expiresAt:d.minutes===0?Math.min(here.expires,here.checked+420):this.clock()+d.minutes*60,untilLeave:d.minutes===0,status:'active',revision:1,messageSeq:0};
    await t.insert('activities',a);await this.activityEvent(t,a);return this.activityDTO(a,u._id);
   });
